@@ -205,6 +205,15 @@ WP_API size_t wp_apic_get_param_size(APICGraph* graph, const char* name);
 
 WP_API bool wp_apic_launch(APICGraph* graph, void* stream);
 
+// Replay a loaded graph's operations into a CUDA capture the caller owns, so the
+// graph's nodes become part of the caller's graph instead of a separate one.
+// `stream` must have a capture that is active and not already managed by Warp.
+// `mode` must be the WP_CUDA_GRAPH_CAPTURE_MODE_* value (see warp.h) the caller
+// began that capture with; CUDA cannot report it, and graphs containing
+// conditional nodes are resumed with it. The caller retains ownership of the
+// capture and is responsible for ending and instantiating it.
+WP_API bool wp_apic_replay_into_capture(APICGraph* graph, void* stream, int mode);
+
 // CPU kernel resolution for loaded graphs (called from Python after loading .o modules)
 WP_API void wp_apic_register_loaded_cpu_kernel(
     APICGraph* graph, const char* kernel_key, const char* module_hash, void* forward_fn, void* backward_fn

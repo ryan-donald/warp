@@ -3365,4 +3365,5 @@ APICGraph* wp_apic_load_graph(void* context, const char* path, int device_type)
 void* wp_apic_get_cuda_graph(APICGraph*) { return nullptr; }
 void* wp_apic_get_cuda_graph_exec(APICGraph*) { return nullptr; }
 bool wp_apic_launch(APICGraph*, void*) { return false; }
+bool wp_apic_replay_into_capture(APICGraph*, void*, int) { return false; }
 #endif  // !WP_ENABLE_CUDA

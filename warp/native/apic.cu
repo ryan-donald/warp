@@ -920,6 +920,33 @@ static bool apic_replay_ops_into_cuda_capture(
     return success;
 }
 
+// Replay the whole operation stream onto an already-capturing `stream`. This
+// function neither begins nor ends the capture and does not own the resulting
+// graph; both belong to whichever entry point called it. Those are
+// apic_rebuild_cuda_graph, which opens and owns its own capture, and
+// wp_apic_replay_into_capture, which adopts one the caller owns. Callers must
+// also run apic_configure_kernel_cluster_attrs before the capture is recording,
+// which is why that pass stays with them rather than moving in here.
+static bool apic_replay_whole_stream(APICGraph* graph, CUstream stream)
+{
+    // Extended ops (REDUCTION/SCAN/SORT/RUNLENGTH/BSR/MEMTILE) issue their kernels on the
+    // context's current stream rather than the passed stream. Point the current
+    // stream at the capture stream so they are recorded into the graph, then
+    // restore it after the replay loop.
+    void* prev_current_stream = wp_cuda_context_get_stream(graph->cuda_context);
+    wp_cuda_context_set_stream(graph->cuda_context, (void*)stream, 0);
+
+    // use_ptx is only consulted for IF/WHILE conditional kernels; loaded .wrp
+    // graphs use the cubin path for the JIT-compiled set-condition kernels.
+    bool success = apic_replay_ops_into_cuda_capture(
+        graph, stream, graph->operation_stream.data(), graph->operation_stream.size(), graph->operation_count,
+        graph->target_arch, false
+    );
+
+    wp_cuda_context_set_stream(graph->cuda_context, prev_current_stream, 0);
+    return success;
+}
+
 static bool apic_rebuild_cuda_graph(APICGraph* graph, CUstream stream)
 {
     // Precondition: graph->operations_validated is true. Enforced by
@@ -945,21 +972,7 @@ static bool apic_rebuild_cuda_graph(APICGraph* graph, CUstream stream)
         return false;
     }
 
-    // Extended ops (REDUCTION/SCAN/SORT/RUNLENGTH/BSR/MEMTILE) issue their kernels on the
-    // context's current stream rather than the passed stream. Point the current
-    // stream at the capture stream so they are recorded into the graph, then
-    // restore it after the replay loop.
-    void* prev_current_stream = wp_cuda_context_get_stream(graph->cuda_context);
-    wp_cuda_context_set_stream(graph->cuda_context, (void*)stream, 0);
-
-    // use_ptx is only consulted for IF/WHILE conditional kernels; loaded .wrp
-    // graphs use the cubin path for the JIT-compiled set-condition kernels.
-    bool success = apic_replay_ops_into_cuda_capture(
-        graph, stream, graph->operation_stream.data(), graph->operation_stream.size(), graph->operation_count,
-        graph->target_arch, false
-    );
-
-    wp_cuda_context_set_stream(graph->cuda_context, prev_current_stream, 0);
+    bool success = apic_replay_whole_stream(graph, stream);
 
     cudaGraph_t captured_graph = nullptr;
     if (!wp_cuda_graph_end_capture(graph->cuda_context, (void*)stream, (void**)&captured_graph)) {
@@ -1108,4 +1121,70 @@ bool wp_apic_launch(APICGraph* graph, void* stream)
         return false;
     }
     return true;
+}
+
+bool wp_apic_replay_into_capture(APICGraph* graph, void* stream, int mode)
+{
+    if (!graph)
+        return false;
+
+    if (!graph->operations_validated) {
+        wp::set_error_string("Graph operations were not validated");
+        return false;
+    }
+
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    cudaError_t err = cudaStreamIsCapturing((cudaStream_t)stream, &status);
+    if (err != cudaSuccess) {
+        wp::set_error_string("Failed to query stream capture status: %d", err);
+        return false;
+    }
+    if (status != cudaStreamCaptureStatusActive) {
+        wp::set_error_string("wp_apic_replay_into_capture requires an active capture on the stream");
+        return false;
+    }
+
+    // Only a capture opened outside Warp can be adopted. Beginning a second
+    // capture on a Warp-managed stream would overwrite its CaptureInfo (leaking
+    // the original) and the end_capture below would clear the caller's capture,
+    // so their capture_end() would later fail with "stream has no capture started".
+    StreamInfo* stream_info = get_stream_info((CUstream)stream);
+    if (stream_info && stream_info->capture) {
+        wp::set_error_string("wp_apic_replay_into_capture cannot adopt a capture that Warp already manages");
+        return false;
+    }
+
+    ContextGuard guard(graph->cuda_context);
+
+    // Driver function-attribute calls, issued before Warp's capture bookkeeping
+    // is registered (the caller's capture is already open, so this is as early
+    // as this entry point can run them).
+    if (!apic_configure_kernel_cluster_attrs(graph))
+        return false;
+
+    // Conditional replay pauses and resumes the capture through Warp's stream
+    // registry. A stream the caller created outside Warp is absent from it and
+    // the resume fails with "unknown stream", so register it here. Registration
+    // is left in place for the stream's lifetime, as it is for Warp's own
+    // streams; re-registering would leak the cached event.
+    if (!stream_info)
+        wp_cuda_stream_register(graph->cuda_context, stream);
+
+    // external=1 registers a Warp CaptureInfo for a capture this function does
+    // not own, without calling cudaStreamBeginCapture. `mode` must match the
+    // mode the caller began the capture with: CUDA cannot report it, and
+    // wp_cuda_graph_resume_capture reopens conditional bodies with the recorded
+    // mode, so a wrong value silently downgrades the caller's capture.
+    if (!wp_cuda_graph_begin_capture(graph->cuda_context, stream, 1, mode))
+        return false;
+
+    bool success = apic_replay_whole_stream(graph, (CUstream)stream);
+
+    // The capture belongs to the caller; end_capture on an external capture only
+    // releases Warp's bookkeeping and returns no graph to own.
+    void* captured_graph = nullptr;
+    if (!wp_cuda_graph_end_capture(graph->cuda_context, stream, &captured_graph))
+        success = false;
+
+    return success;
 }
