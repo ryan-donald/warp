@@ -14,8 +14,11 @@
 #include <cassert>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 
 #include <cub/cub.cuh>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
 
 // temporary buffer for radix sort
 struct TempBuffer {
@@ -178,7 +181,7 @@ static bool acquire_temp_buffer(size_t size, TempBuffer& temp_ret)
         TempBuffer& temp = g_temp_cache[get_stream_id(stream)];
         if (size > temp.size) {
             if (temp.mem) {
-                wp_free_device(WP_CURRENT_CONTEXT, temp.mem);
+                free_device_on_stream(WP_CURRENT_CONTEXT, temp.mem, stream);
             }
             temp.mem = wp_alloc_device(WP_CURRENT_CONTEXT, size, "(native:sort)");
             temp.size = temp.mem ? size : 0;
@@ -229,14 +232,19 @@ void radix_sort_stream_release(void* context, void* stream)
     // stored stream handle rather than the stream id, since the id cannot be
     // queried while the stream is capturing. As a bonus, this also reclaims
     // entries leaked by externally destroyed streams once their handle is reused.
+    // The stream can be released while another stream on this thread is capturing,
+    // so relax the capture mode to allow freeing on this non-capturing stream.
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    check_cuda(cudaThreadExchangeStreamCaptureMode(&mode));
     for (auto it = g_temp_cache.begin(); it != g_temp_cache.end();) {
         if (it->second.stream == static_cast<CUstream>(stream)) {
-            wp_free_device(context, it->second.mem);
+            free_device_on_stream(context, it->second.mem, stream);
             it = g_temp_cache.erase(it);
         } else {
             ++it;
         }
     }
+    check_cuda(cudaThreadExchangeStreamCaptureMode(&mode));
 
     // release capture-specific info for the given stream
     for (auto& kv : g_temp_cache_per_capture) {
@@ -461,23 +469,55 @@ void wp_radix_sort_pairs_uint64_device(
     );
 }
 
-size_t segmented_sort_temp_size(void* context, int n, int num_segments)
+template <bool IsBegin> struct ValidatedSegmentOffset {
+    const int* segment_start_indices;
+    const int* segment_end_indices;
+    int count;
+
+    __host__ __device__ __forceinline__ int operator()(int segment_index) const
+    {
+        const int start = segment_start_indices[segment_index];
+        const int end = segment_end_indices[segment_index];
+        if (start < 0 || end < start || end > count)
+            return 0;
+        return IsBegin ? start : end;
+    }
+};
+
+// CUB accepts iterator-defined offsets. Map each invalid pair to [0, 0) so
+// malformed device-resident metadata cannot address outside the input buffers.
+// This avoids a device-to-host copy or synchronization and remains safe during
+// CUDA graph capture.
+auto make_validated_segment_offsets(int* segment_start_indices, int* segment_end_indices, int count)
+{
+    auto segment_indices = thrust::make_counting_iterator(0);
+    auto begin_offsets = thrust::make_transform_iterator(
+        segment_indices, ValidatedSegmentOffset<true> { segment_start_indices, segment_end_indices, count }
+    );
+    auto end_offsets = thrust::make_transform_iterator(
+        segment_indices, ValidatedSegmentOffset<false> { segment_start_indices, segment_end_indices, count }
+    );
+    return std::make_pair(begin_offsets, end_offsets);
+}
+
+size_t
+segmented_sort_temp_size(void* context, int n, int num_segments, int* segment_start_indices, int* segment_end_indices)
 {
     ContextGuard guard(context);
 
     cub::DoubleBuffer<int> d_keys;
     cub::DoubleBuffer<int> d_values;
 
-    int* start_indices = NULL;
-    int* end_indices = NULL;
+    auto segment_offsets = make_validated_segment_offsets(segment_start_indices, segment_end_indices, n);
 
     CUstream stream = static_cast<CUstream>(wp_cuda_stream_get_current());
 
     // compute temporary memory required
-    size_t sort_temp_size;
+    size_t sort_temp_size = 0;
     if (check_cuda(
             cub::DeviceSegmentedRadixSort::SortPairs(
-                NULL, sort_temp_size, d_keys, d_values, n, num_segments, start_indices, end_indices, 0, 32, stream
+                NULL, sort_temp_size, d_keys, d_values, n, num_segments, segment_offsets.first, segment_offsets.second,
+                0, 32, stream
             )
         )) {
         return sort_temp_size;
@@ -488,7 +528,7 @@ size_t segmented_sort_temp_size(void* context, int n, int num_segments)
 
 // segment_start_indices and segment_end_indices are arrays of length num_segments, where segment_start_indices[i] is
 // the index of the first element in the i-th segment and segment_end_indices[i] is the index after the last element in
-// the i-th segment https://nvidia.github.io/cccl/cub/api/structcub_1_1DeviceSegmentedRadixSort.html
+// the i-th segment https://nvidia.github.io/cccl/unstable/cub/api/structcub_1_1DeviceSegmentedRadixSort.html
 void segmented_sort_pairs_device(
     void* context,
     float* keys,
@@ -505,7 +545,9 @@ void segmented_sort_pairs_device(
     cub::DoubleBuffer<int> d_values(values, values + n);
 
     CUstream stream = static_cast<CUstream>(wp_cuda_stream_get_current());
-    size_t temp_size = segmented_sort_temp_size(WP_CURRENT_CONTEXT, n, num_segments);
+    auto segment_offsets = make_validated_segment_offsets(segment_start_indices, segment_end_indices, n);
+    size_t temp_size
+        = segmented_sort_temp_size(WP_CURRENT_CONTEXT, n, num_segments, segment_start_indices, segment_end_indices);
 
     TempBuffer temp;
     if (!acquire_temp_buffer(temp_size, temp)) {
@@ -516,8 +558,8 @@ void segmented_sort_pairs_device(
     // sort
     check_cuda(
         cub::DeviceSegmentedRadixSort::SortPairs(
-            temp.mem, temp.size, d_keys, d_values, n, num_segments, segment_start_indices, segment_end_indices, 0, 32,
-            stream
+            temp.mem, temp.size, d_keys, d_values, n, num_segments, segment_offsets.first, segment_offsets.second, 0,
+            32, stream
         )
     );
 
@@ -550,7 +592,7 @@ void wp_segmented_sort_pairs_float_device(
 
 // segment_indices is an array of length num_segments + 1, where segment_indices[i] is the index of the first element in
 // the i-th segment The end of a segment is given by segment_indices[i+1]
-// https://nvidia.github.io/cccl/cub/api/structcub_1_1DeviceSegmentedSort.html#a-simple-example
+// https://nvidia.github.io/cccl/unstable/cub/api/structcub_1_1DeviceSegmentedSort.html#a-simple-example
 void segmented_sort_pairs_device(
     void* context, int* keys, int* values, int n, int* segment_start_indices, int* segment_end_indices, int num_segments
 )
@@ -561,7 +603,9 @@ void segmented_sort_pairs_device(
     cub::DoubleBuffer<int> d_values(values, values + n);
 
     CUstream stream = static_cast<CUstream>(wp_cuda_stream_get_current());
-    size_t temp_size = segmented_sort_temp_size(WP_CURRENT_CONTEXT, n, num_segments);
+    auto segment_offsets = make_validated_segment_offsets(segment_start_indices, segment_end_indices, n);
+    size_t temp_size
+        = segmented_sort_temp_size(WP_CURRENT_CONTEXT, n, num_segments, segment_start_indices, segment_end_indices);
 
     TempBuffer temp;
     if (!acquire_temp_buffer(temp_size, temp)) {
@@ -572,8 +616,8 @@ void segmented_sort_pairs_device(
     // sort
     check_cuda(
         cub::DeviceSegmentedRadixSort::SortPairs(
-            temp.mem, temp.size, d_keys, d_values, n, num_segments, segment_start_indices, segment_end_indices, 0, 32,
-            stream
+            temp.mem, temp.size, d_keys, d_values, n, num_segments, segment_offsets.first, segment_offsets.second, 0,
+            32, stream
         )
     );
 

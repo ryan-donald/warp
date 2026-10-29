@@ -9,10 +9,15 @@ import numpy as np
 
 import warp as wp
 import warp.fem as fem
+from warp._src.fem import utils as fem_utils
 from warp._src.fem.geometry.closest_point import project_on_tet_at_origin, project_on_tri_at_origin
 from warp.fem import Coords, Domain, Sample, integrand, make_free_sample
 from warp.fem.utils import grid_to_hexes, grid_to_quads, grid_to_tets, grid_to_tris
 from warp.tests.unittest_utils import *
+
+
+class _CacheIdentityHexmesh(fem.Hexmesh):
+    """Provide an isolated evaluator-cache namespace for cache identity tests."""
 
 
 def _gen_trimesh(Nx, Ny):
@@ -70,6 +75,11 @@ def _test_geo_cells(
     wp.atomic_add(cell_measures, s.element_index, fem.measure(domain, s) * s.qp_weight)
 
 
+@fem.integrand(kernel_options={"enable_backward": False})
+def _cell_position(s: fem.Sample, domain: fem.Domain):
+    return domain(s)
+
+
 @fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 2})
 def _test_cell_lookup(s: fem.Sample, domain: fem.Domain, cell_filter: wp.array[int]):
     pos = domain(s)
@@ -107,6 +117,22 @@ def _test_guess_lookup_radius(s: fem.Sample, domain: fem.Domain):
 
     s_guess = fem.lookup(domain, pos, s)
     wp.expect_neq(s_guess.element_index, fem.NULL_ELEMENT_INDEX)
+
+
+@fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 1})
+def _nanogrid_nearby_lookup_indices(
+    s: fem.Sample,
+    domain: fem.Domain,
+    pos: wp.vec3,
+    cell_filter: wp.array[int],
+    filter_target: int,
+):
+    """Return nearby-cell indices from each lookup overload for comparison."""
+    lookup = fem.lookup(domain, pos, 0.25)
+    filtered = fem.lookup(domain, pos, 0.25, cell_filter, filter_target)
+    guessed = fem.lookup(domain, pos, s)
+    explicit_env = fem.lookup(domain, pos, 0.25, 0)
+    return wp.vec4i(lookup.element_index, filtered.element_index, guessed.element_index, explicit_env.element_index)
 
 
 @fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 1})
@@ -242,6 +268,63 @@ def test_triangle_mesh(test, device):
     test.assertAlmostEqual(np.sum(side_measures.numpy()), 2 * (N + 1) + N * math.sqrt(2.0), places=4)
 
 
+def test_mesh_rejects_invalid_vertex_indices(test, device):
+    """Verify that mesh constructors reject out-of-range vertex indices."""
+    mesh_cases = (
+        ("Trimesh", fem.Trimesh2D, "tri_vertex_indices", wp.vec2, 3),
+        ("Quadmesh", fem.Quadmesh2D, "quad_vertex_indices", wp.vec2, 4),
+        ("Tetmesh", fem.Tetmesh, "tet_vertex_indices", wp.vec3, 4),
+        ("Hexmesh", fem.Hexmesh, "hex_vertex_indices", wp.vec3, 8),
+    )
+
+    for mesh_name, mesh_type, index_arg_name, position_dtype, vertex_count in mesh_cases:
+        positions = wp.zeros(vertex_count, dtype=position_dtype, device=device)
+        for invalid_index in (-1, vertex_count, (1 << 31) - 2, fem.NULL_NODE_INDEX):
+            vertex_indices = list(range(vertex_count))
+            invalid_position = vertex_count - 1
+            vertex_indices[invalid_position] = invalid_index
+            connectivity = wp.array([vertex_indices], dtype=int, device=device)
+
+            with test.subTest(mesh=mesh_name, invalid_index=invalid_index):
+                with test.assertRaises(ValueError) as context:
+                    mesh_type(**{index_arg_name: connectivity, "positions": positions})
+                message = str(context.exception)
+                test.assertIn(f"Vertex index {invalid_index}", message)
+                test.assertIn(f"flattened array index {invalid_position}", message)
+                test.assertIn(f"expected a value in [0, {vertex_count})", message)
+
+
+def test_compress_node_indices_ignores_out_of_range_values(test, device):
+    """Verify that node-index compression ignores invalid values without overrunning offsets."""
+    backing_offsets = wp.full(12, -99, dtype=int, device=device)
+    node_offsets = wp.array(ptr=backing_offsets.ptr, shape=(4,), dtype=int, device=device, copy=False)
+    node_indices = wp.array([0, 1, 2, 3, 4, 5, -1], dtype=int, device=device)
+
+    _, sorted_indices, unique_count, unique_indices = fem_utils.compress_node_indices(
+        3, node_indices, node_offsets=node_offsets, return_unique_nodes=True
+    )
+
+    np.testing.assert_array_equal(node_offsets.numpy(), [0, 1, 2, 3])
+    np.testing.assert_array_equal(backing_offsets.numpy()[4:], np.full(8, -99))
+    test.assertEqual(unique_count.numpy()[0], 3)
+    np.testing.assert_array_equal(unique_indices.numpy()[:3], [0, 1, 2])
+
+    sorted_indices.release()
+    unique_count.release()
+    unique_indices.release()
+
+
+def test_validate_indices_in_range_rejects_invalid_values(test, device):
+    """Verify that generic index validation rejects values beyond the upper bound."""
+    indices = wp.array([0, 2, 3], dtype=int, device=device)
+
+    with test.assertRaisesRegex(
+        ValueError,
+        r"Particle index 3 at flattened array index 2 is out of bounds; expected a value in \[0, 3\)",
+    ):
+        fem_utils.validate_indices_in_range(3, indices, index_name="Particle")
+
+
 def test_quad_mesh(test, device):
     N = 3
 
@@ -344,6 +427,37 @@ def test_hex_mesh(test, device):
 
     assert_np_equal(side_measures.numpy(), np.full(side_measures.shape, 1.0 / (N**2)), tol=1.0e-4)
     assert_np_equal(cell_measures.numpy(), np.full(cell_measures.shape, 1.0 / (N**3)), tol=1.0e-4)
+
+
+def test_hex_mesh_evaluation_mode_identity(test, device):
+    """Verify that Hexmesh evaluation modes do not share cached evaluators."""
+    with wp.ScopedDevice(device):
+        # Distort vertex 6 so the general trilinear center differs from the parallelepiped shortcut.
+        positions = wp.array(
+            [
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (1.0, 1.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+                (1.0, 0.0, 1.0),
+                (2.0, 2.0, 2.0),
+                (0.0, 1.0, 1.0),
+            ],
+            dtype=wp.vec3,
+            device=device,
+        )
+        vertex_indices = wp.array([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=int, device=device)
+
+        # Prime the isolated cache namespace with the shortcut before constructing the general mesh.
+        _CacheIdentityHexmesh(vertex_indices, positions, assume_parallelepiped_cells=True)
+        general_mesh = _CacheIdentityHexmesh(vertex_indices, positions, assume_parallelepiped_cells=False)
+
+        quadrature = fem.RegularQuadrature(fem.Cells(general_mesh), order=0)
+        sampled_position = wp.empty(1, dtype=wp.vec3, device=device)
+        fem.interpolate(_cell_position, dest=sampled_position, at=quadrature)
+
+        np.testing.assert_allclose(sampled_position.numpy(), [[0.625, 0.625, 0.625]])
 
 
 def test_nanogrid(test, device):
@@ -585,6 +699,71 @@ def test_nanogrid_guess_lookup_radius(test, device):
         fem.interpolate(_test_guess_lookup_radius, at=quadrature)
 
 
+def test_nanogrid_single_env_nearby_lookup(test, device):
+    """Find nearby cells at negative coordinates without an explicit environment index."""
+    with wp.ScopedDevice(device):
+        for grid_type in ("regular", "rebuildable", "adaptive"):
+            for axis in range(3):
+                # Keep one positive-coordinate control per grid type.
+                coordinates = (-2, -1, 1) if axis == 0 else (-2, -1)
+                for coordinate in coordinates:
+                    cell = np.zeros((1, 3), dtype=np.int32)
+                    cell[0, axis] = coordinate
+                    points = wp.array(cell, dtype=wp.vec3i, device=device)
+                    env_indices = wp.zeros(1, dtype=int, device=device)
+                    if grid_type == "adaptive":
+                        geo = fem.AdaptiveNanogrid.from_environment_voxels(
+                            points,
+                            wp.zeros(1, dtype=wp.uint8, device=device),
+                            env_indices,
+                            1,
+                            level_count=1,
+                            env_offsets=[[0, 0, 0]],
+                            voxel_size=1.0,
+                            device=device,
+                        )
+                    else:
+                        geo = fem.Nanogrid.from_environment_voxels(
+                            points,
+                            env_indices,
+                            1,
+                            env_offsets=[[0, 0, 0]],
+                            voxel_size=1.0,
+                            rebuildable=grid_type == "rebuildable",
+                            max_active_voxels=1 if grid_type == "rebuildable" else None,
+                            device=device,
+                        )
+                    domain = fem.Cells(geo)
+                    quadrature = fem.RegularQuadrature(domain, order=0)
+                    cell_filter = wp.ones(1, dtype=int, device=device)
+                    indices = wp.empty(1, dtype=wp.vec4i, device=device)
+
+                    directions = (-1, 1) if coordinate < 0 else (1,)
+                    for direction in directions:
+                        with test.subTest(grid_type=grid_type, axis=axis, coordinate=coordinate, direction=direction):
+                            pos = np.zeros(3, dtype=np.float32)
+                            pos[axis] = coordinate + direction * 0.6
+                            positions = wp.array([pos], dtype=wp.vec3, device=device)
+                            pic = fem.PicQuadrature(domain, positions=positions, max_dist=0.25)
+                            values = {"pos": wp.vec3(*pos), "cell_filter": cell_filter, "filter_target": 1}
+                            fem.interpolate(_nanogrid_nearby_lookup_indices, dest=indices, at=quadrature, values=values)
+                            np.testing.assert_array_equal(indices.numpy(), [[0, 0, 0, 0]])
+                            np.testing.assert_array_equal(pic.cell_indices.numpy(), [0])
+
+                            # Check environment parity and filter rejection once per grid type.
+                            if axis == 0 and coordinate == -1 and direction == 1:
+                                pic_explicit_env = fem.PicQuadrature(
+                                    domain, positions=positions, env_indices=env_indices, max_dist=0.25
+                                )
+                                np.testing.assert_array_equal(pic_explicit_env.cell_indices.numpy(), [0])
+
+                                values["filter_target"] = 0
+                                fem.interpolate(
+                                    _nanogrid_nearby_lookup_indices, dest=indices, at=quadrature, values=values
+                                )
+                                np.testing.assert_array_equal(indices.numpy(), [[0, -1, 0, 0]])
+
+
 @wp.func
 def _refinement_field(x: wp.vec3):
     return 4.0 * (wp.length(x) - 0.5)
@@ -718,6 +897,73 @@ def test_deformed_geometry(test, device):
         )
 
 
+@integrand
+def _rigid_deformation_field_2d(s: Sample, domain: Domain, translation: wp.vec2, rotation: float, scale: float):
+    """Compute rigid 2D deformation displacement."""
+    x = domain(s)
+    c = wp.cos(rotation)
+    s_rot = wp.sin(rotation)
+    rot_x = wp.vec2(c * x[0] - s_rot * x[1], s_rot * x[0] + c * x[1])
+    return translation + scale * rot_x - x
+
+
+@fem.integrand(kernel_options={"enable_backward": False})
+def _test_deformed_2d_cell_lookup(s: fem.Sample, domain: fem.Domain):
+    """Verify lookup queries with and without initial guess."""
+    pos = domain(s)
+
+    s_guess = fem.lookup(domain, pos, s)
+    wp.expect_eq(s_guess.element_index, s.element_index)
+    wp.expect_near(domain(s_guess), pos, 0.001)
+
+    s_noguess = fem.lookup(domain, pos)
+    wp.expect_eq(s_noguess.element_index, s.element_index)
+    wp.expect_near(domain(s_noguess), pos, 0.001)
+
+
+def test_deformed_geometry_2d(test, device):
+    """Verify BVH construction and cell lookups on two-dimensional deformed geometry."""
+    N = 3
+
+    translation = wp.vec2(1.0, 2.0)
+    rotation = math.pi / 4.0
+    scale = 2.0
+
+    with wp.ScopedDevice(device):
+        positions, tri_vidx = _gen_trimesh(N, N)
+        geo = fem.Trimesh2D(tri_vertex_indices=tri_vidx, positions=positions)
+
+        vector_space = fem.make_polynomial_space(geo, dtype=wp.vec2, degree=2)
+        pos_field = vector_space.make_field()
+        fem.interpolate(
+            _rigid_deformation_field_2d,
+            dest=pos_field,
+            values={"translation": translation, "rotation": rotation, "scale": scale},
+        )
+
+        deformed_geo = pos_field.make_deformed_geometry()
+
+        test.assertEqual(geo.cell_count(), 2 * N * N)
+        test.assertEqual(geo.vertex_count(), (N + 1) ** 2)
+
+        test.assertFalse(deformed_geo.supports_cell_lookup(device))
+        deformed_geo.build_bvh()
+        test.assertTrue(deformed_geo.supports_cell_lookup(device))
+
+        cell_measures = wp.zeros(dtype=float, device=device, shape=deformed_geo.cell_count())
+        cell_quadrature = fem.RegularQuadrature(fem.Cells(deformed_geo), order=2)
+        fem.interpolate(_test_geo_cells, at=cell_quadrature, values={"cell_measures": cell_measures})
+
+        test.assertAlmostEqual(
+            np.sum(cell_measures.numpy()), scale**2, places=4, msg=f"cell_measures = {cell_measures.numpy()}"
+        )
+
+        fem.interpolate(_test_deformed_2d_cell_lookup, at=cell_quadrature)
+
+        deformed_geo_auto = fem.geometry.DeformedGeometry(pos_field, build_bvh=True)
+        test.assertTrue(deformed_geo_auto.supports_cell_lookup(device))
+
+
 def test_deformed_geometry_codimensional(test, device):
     N = 3
 
@@ -800,7 +1046,7 @@ def _test_closest_point_on_tet_kernel(
 
 
 def test_closest_point_queries(test, device):
-    # Test some simple lookup queries
+    """Test basic closest-point lookup queries."""
     e0 = wp.vec2(2.0, 0.0)
     e1 = wp.vec2(0.0, 2.0)
 
@@ -875,11 +1121,32 @@ class TestFemGeometry(unittest.TestCase):
 
 add_function_test(TestFemGeometry, "test_grid_2d", test_grid_2d, devices=devices)
 add_function_test(TestFemGeometry, "test_triangle_mesh", test_triangle_mesh, devices=devices)
+add_function_test(
+    TestFemGeometry,
+    "test_mesh_rejects_invalid_vertex_indices",
+    test_mesh_rejects_invalid_vertex_indices,
+    devices=devices,
+)
+add_function_test(
+    TestFemGeometry,
+    "test_compress_node_indices_ignores_out_of_range_values",
+    test_compress_node_indices_ignores_out_of_range_values,
+    devices=devices,
+)
+add_function_test(
+    TestFemGeometry,
+    "test_validate_indices_in_range_rejects_invalid_values",
+    test_validate_indices_in_range_rejects_invalid_values,
+    devices=devices,
+)
 add_function_test(TestFemGeometry, "test_quad_mesh", test_quad_mesh, devices=devices)
 add_function_test(TestFemGeometry, "test_mesh_guess_lookup_radius", test_mesh_guess_lookup_radius, devices=devices)
 add_function_test(TestFemGeometry, "test_grid_3d", test_grid_3d, devices=devices)
 add_function_test(TestFemGeometry, "test_tet_mesh", test_tet_mesh, devices=devices)
 add_function_test(TestFemGeometry, "test_hex_mesh", test_hex_mesh, devices=devices)
+add_function_test(
+    TestFemGeometry, "test_hex_mesh_evaluation_mode_identity", test_hex_mesh_evaluation_mode_identity, devices=devices
+)
 add_function_test(TestFemGeometry, "test_nanogrid", test_nanogrid, devices=cuda_devices)
 add_function_test(TestFemGeometry, "test_nanogrid_rebuild", test_nanogrid_rebuild, devices=devices)
 add_function_test(
@@ -891,8 +1158,15 @@ add_function_test(
 add_function_test(
     TestFemGeometry, "test_nanogrid_guess_lookup_radius", test_nanogrid_guess_lookup_radius, devices=cuda_devices
 )
+add_function_test(
+    TestFemGeometry,
+    "test_nanogrid_single_env_nearby_lookup",
+    test_nanogrid_single_env_nearby_lookup,
+    devices=cuda_devices,
+)
 add_function_test(TestFemGeometry, "test_adaptive_nanogrid", test_adaptive_nanogrid, devices=cuda_devices)
 add_function_test(TestFemGeometry, "test_deformed_geometry", test_deformed_geometry, devices=devices)
+add_function_test(TestFemGeometry, "test_deformed_geometry_2d", test_deformed_geometry_2d, devices=devices)
 add_function_test(
     TestFemGeometry, "test_deformed_geometry_codimensional", test_deformed_geometry_codimensional, devices=devices
 )

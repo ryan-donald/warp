@@ -734,90 +734,6 @@ template <typename T> CUDA_CALLABLE inline T& index(const indexedarray_t<T>& iar
 }
 
 
-// Unlike the variadic slice overload, these default-construct their result.
-// See 7e5fb05b for the sm_89 NVCC miscompile behind that difference.
-template <typename T> CUDA_CALLABLE inline array_t<T> view(array_t<T>& src, int i)
-{
-    assert(src.ndim > 1);
-    assert(i >= -src.shape[0] && i < src.shape[0]);
-
-    if (i < 0) {
-        i += src.shape[0];
-    }
-
-    array_t<T> a;
-    size_t offset = byte_offset(src, i);
-    a.data = data_at_byte_offset(src, offset);
-    if (src.grad)
-        a.grad = grad_at_byte_offset(src, offset);
-    a.shape[0] = src.shape[1];
-    a.shape[1] = src.shape[2];
-    a.shape[2] = src.shape[3];
-    a.strides[0] = src.strides[1];
-    a.strides[1] = src.strides[2];
-    a.strides[2] = src.strides[3];
-    a.ndim = src.ndim - 1;
-
-    return a;
-}
-
-template <typename T> CUDA_CALLABLE inline array_t<T> view(array_t<T>& src, int i, int j)
-{
-    assert(src.ndim > 2);
-    assert(i >= -src.shape[0] && i < src.shape[0]);
-    assert(j >= -src.shape[1] && j < src.shape[1]);
-
-    if (i < 0) {
-        i += src.shape[0];
-    }
-    if (j < 0) {
-        j += src.shape[1];
-    }
-
-    array_t<T> a;
-    size_t offset = byte_offset(src, i, j);
-    a.data = data_at_byte_offset(src, offset);
-    if (src.grad)
-        a.grad = grad_at_byte_offset(src, offset);
-    a.shape[0] = src.shape[2];
-    a.shape[1] = src.shape[3];
-    a.strides[0] = src.strides[2];
-    a.strides[1] = src.strides[3];
-    a.ndim = src.ndim - 2;
-
-    return a;
-}
-
-template <typename T> CUDA_CALLABLE inline array_t<T> view(array_t<T>& src, int i, int j, int k)
-{
-    assert(src.ndim > 3);
-    assert(i >= -src.shape[0] && i < src.shape[0]);
-    assert(j >= -src.shape[1] && j < src.shape[1]);
-    assert(k >= -src.shape[2] && k < src.shape[2]);
-
-    if (i < 0) {
-        i += src.shape[0];
-    }
-    if (j < 0) {
-        j += src.shape[1];
-    }
-    if (k < 0) {
-        k += src.shape[2];
-    }
-
-    array_t<T> a;
-    size_t offset = byte_offset(src, i, j, k);
-    a.data = data_at_byte_offset(src, offset);
-    if (src.grad)
-        a.grad = grad_at_byte_offset(src, offset);
-    a.shape[0] = src.shape[3];
-    a.strides[0] = src.strides[3];
-    a.ndim = src.ndim - 3;
-
-    return a;
-}
-
-
 CUDA_CALLABLE inline slice_t view_arg_as_slice(int index) { return { index, index, 1 }; }
 
 CUDA_CALLABLE inline slice_t view_arg_as_slice(const slice_t& slice) { return slice; }
@@ -828,7 +744,8 @@ CUDA_CALLABLE inline bool view_arg_is_slice(const slice_t&) { return true; }
 
 
 template <typename T, size_t... Idxs>
-size_t byte_offset_helper(array_t<T>& src, const slice_t (&slices)[sizeof...(Idxs)], index_sequence<Idxs...>)
+inline CUDA_CALLABLE size_t
+byte_offset_helper(array_t<T>& src, const slice_t (&slices)[sizeof...(Idxs)], index_sequence<Idxs...>)
 {
     return byte_offset(src, slices[Idxs].start...);
 }
@@ -1065,6 +982,47 @@ template <template <typename> class A, typename T>
 inline CUDA_CALLABLE T atomic_sub(const A<T>& buf, int i, int j, int k, int l, T value)
 {
     return atomic_add(&index(buf, i, j, k, l), -value);
+}
+
+// SlotType is the value type of the referenced component returned by access(),
+// such as a scalar vector component or a matrix row.
+template <typename T, typename SlotType, typename Accessor, typename... Ints>
+inline CUDA_CALLABLE SlotType
+array_atomic_add_slot(const array_t<T>& buf, SlotType value, Accessor access, Ints... indices)
+{
+    SlotType old = atomic_add(&access(index(buf, indices...)), value);
+    FP_VERIFY_FWD(old + value)
+    return old;
+}
+
+template <typename T, typename SlotType, typename Accessor, typename... Ints>
+inline CUDA_CALLABLE SlotType
+array_atomic_sub_slot(const array_t<T>& buf, SlotType value, Accessor access, Ints... indices)
+{
+    SlotType old = atomic_add(&access(index(buf, indices...)), -value);
+    FP_VERIFY_FWD(old - value)
+    return old;
+}
+
+template <typename T, typename SlotType, typename Accessor, typename... Ints>
+inline CUDA_CALLABLE SlotType
+array_atomic_and_slot(const array_t<T>& buf, SlotType value, Accessor access, Ints... indices)
+{
+    return atomic_and(&access(index(buf, indices...)), value);
+}
+
+template <typename T, typename SlotType, typename Accessor, typename... Ints>
+inline CUDA_CALLABLE SlotType
+array_atomic_or_slot(const array_t<T>& buf, SlotType value, Accessor access, Ints... indices)
+{
+    return atomic_or(&access(index(buf, indices...)), value);
+}
+
+template <typename T, typename SlotType, typename Accessor, typename... Ints>
+inline CUDA_CALLABLE SlotType
+array_atomic_xor_slot(const array_t<T>& buf, SlotType value, Accessor access, Ints... indices)
+{
+    return atomic_xor(&access(index(buf, indices...)), value);
 }
 
 template <template <typename> class A, typename T> inline CUDA_CALLABLE T atomic_min(const A<T>& buf, int i, T value)
@@ -1400,17 +1358,8 @@ adj_array_store(const array_t<T>& buf, int i, T value, const array_t<T>& adj_buf
     FP_VERIFY_ADJ_1(value, adj_value)
 }
 
-// Slot-level variant of adj_array_store. Reads and (optionally) zeros a
-// specific slot within an array element, rather than treating the whole
-// element as the adjoint value. Used to give in-place composite-component
-// writes (``arr[i].y = rhs``, ``arr[i][r, c] = rhs``, ``arr[i].field = rhs``)
-// a correct O(1) backward pass that matches the O(1) single-slot forward
-// instead of the whole-element cost the full ``adj_array_store`` incurs.
-//
-// The ``access`` functor maps an element ``T&`` to the slot reference
-// within it — encode any composite-component access chain at codegen
-// time via a short lambda. Variadic ``Ints`` carries the array indices
-// so this template handles 1-D through N-D arrays uniformly.
+// Slot-level array-store adjoint for composite-component writes.
+// ``access`` maps an array element to the overwritten slot.
 template <typename T, typename Accessor, typename AdjSlot, typename... Ints>
 inline CUDA_CALLABLE void adj_array_store_slot(
     const array_t<T>& buf, const array_t<T>& adj_buf, AdjSlot& adj_value, Accessor access, Ints... indices
@@ -1429,6 +1378,58 @@ inline CUDA_CALLABLE void adj_array_store_slot(
     }
 
     FP_VERIFY_ADJ_SLOT(adj_value)
+}
+
+template <typename T, typename Accessor, typename AdjSlot, typename... Ints>
+inline CUDA_CALLABLE void adj_array_atomic_add_slot(
+    const array_t<T>& buf, const array_t<T>& adj_buf, AdjSlot& adj_value, Accessor access, Ints... indices
+)
+{
+    if (adj_buf.data) {
+        adj_value += access(index(adj_buf, indices...));
+    } else if (buf.grad) {
+        adj_value += access(index_grad(buf, indices...));
+    }
+
+    FP_VERIFY_ADJ_SLOT(adj_value)
+}
+
+template <typename T, typename Accessor, typename AdjSlot, typename... Ints>
+inline CUDA_CALLABLE void adj_array_atomic_sub_slot(
+    const array_t<T>& buf, const array_t<T>& adj_buf, AdjSlot& adj_value, Accessor access, Ints... indices
+)
+{
+    if (adj_buf.data) {
+        adj_value -= access(index(adj_buf, indices...));
+    } else if (buf.grad) {
+        adj_value -= access(index_grad(buf, indices...));
+    }
+
+    FP_VERIFY_ADJ_SLOT(adj_value)
+}
+
+template <typename T, typename Accessor, typename AdjSlot, typename... Ints>
+inline CUDA_CALLABLE void adj_array_atomic_and_slot(
+    const array_t<T>& buf, const array_t<T>& adj_buf, AdjSlot& adj_value, Accessor access, Ints... indices
+)
+{
+    // Bitwise integer atomics are intentionally non-differentiable.
+}
+
+template <typename T, typename Accessor, typename AdjSlot, typename... Ints>
+inline CUDA_CALLABLE void adj_array_atomic_or_slot(
+    const array_t<T>& buf, const array_t<T>& adj_buf, AdjSlot& adj_value, Accessor access, Ints... indices
+)
+{
+    // Bitwise integer atomics are intentionally non-differentiable.
+}
+
+template <typename T, typename Accessor, typename AdjSlot, typename... Ints>
+inline CUDA_CALLABLE void adj_array_atomic_xor_slot(
+    const array_t<T>& buf, const array_t<T>& adj_buf, AdjSlot& adj_value, Accessor access, Ints... indices
+)
+{
+    // Bitwise integer atomics are intentionally non-differentiable.
 }
 
 template <typename T>

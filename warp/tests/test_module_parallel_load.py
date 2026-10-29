@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for parallel module compilation via the max_workers option in
-wp.force_load() and wp.load_module().
-"""
+"""Tests for parallel module compilation through ``wp.force_load()`` and ``wp.load_module()``."""
 
+import importlib
 import os
 import subprocess
 import sys
@@ -202,6 +201,67 @@ class TestModuleParallelLoad(unittest.TestCase):
         wp.force_load(device="cpu", modules=modules, max_workers=2)
         _assert_modules_loaded_on_cpu(self, modules)
 
+    def test_force_load_parallel_propagates_load_failure(self):
+        """Verify that parallel loading propagates a module-load failure."""
+        module_name = "warp.tests.aux_test_unresolved_func"
+        # Importing registers the invalid kernel without compiling it; force_load() triggers the real codegen error.
+        unresolved_func_module = importlib.import_module(module_name)
+        failed_module = wp.get_module(unresolved_func_module.__name__)
+
+        # The valid companion selects the parallel path and must finish loading before the error reaches the caller.
+        valid_module = _generate_modules(1)[0]
+
+        try:
+            with self.assertRaisesRegex(AttributeError, "Could not find function wp.missing_func"):
+                wp.force_load(device="cpu", modules=[failed_module, valid_module], max_workers=2)
+
+            _assert_modules_loaded_on_cpu(self, [valid_module])
+        finally:
+            # Keep the invalid fixture out of later force_load() calls.
+            context.user_modules.pop(module_name, None)
+            sys.modules.pop(module_name, None)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
+    def test_force_load_restores_cuda_context_on_failure(self):
+        """Verify that a module-load failure restores the calling thread's CUDA context."""
+        module_name = "warp.tests.aux_test_unresolved_func"
+        unresolved_func_module = importlib.import_module(module_name)
+        failed_module = wp.get_module(unresolved_func_module.__name__)
+        valid_module = _generate_modules(1)[0]
+        device = wp.get_device("cuda:0")
+
+        original_context = context.runtime.core.wp_cuda_context_get_current()
+        context.runtime.core.wp_cuda_context_set_current(None)
+        try:
+            with self.assertRaisesRegex(AttributeError, "Could not find function wp.missing_func"):
+                wp.force_load(device=device, modules=[valid_module, failed_module], max_workers=0)
+
+            self.assertIsNone(context.runtime.core.wp_cuda_context_get_current())
+        finally:
+            context.runtime.core.wp_cuda_context_set_current(original_context)
+            context.user_modules.pop(module_name, None)
+            sys.modules.pop(module_name, None)
+
+    def test_force_load_preserves_error_without_cuda_context_snapshot(self):
+        """Verify that cleanup does not mask a load error when no CUDA context was saved."""
+        module_name = "warp.tests.aux_test_unresolved_func"
+        unresolved_func_module = importlib.import_module(module_name)
+        failed_module = wp.get_module(unresolved_func_module.__name__)
+
+        try:
+            # Model CUDA becoming available after the entry-time snapshot check.
+            # There is no caller context to restore in this case, so cleanup must
+            # preserve the original module-load error.
+            with (
+                mock.patch.object(context, "is_cuda_driver_initialized", return_value=False),
+                mock.patch.object(context, "is_cuda_available", return_value=True),
+                self.assertRaisesRegex(AttributeError, "Could not find function wp.missing_func"),
+            ):
+                wp.force_load(device="cpu", modules=[failed_module], max_workers=0)
+        finally:
+            context.user_modules.pop(module_name, None)
+            sys.modules.pop(module_name, None)
+
     def test_force_load_config_default(self):
         """Verify that wp.config.load_module_max_workers is respected when max_workers is not passed."""
         modules = _generate_modules(2)
@@ -346,11 +406,11 @@ class TestParallelLoadSharedHelper(unittest.TestCase):
         return modules
 
     def test_force_load_parallel_with_shared_func(self):
-        """N modules sharing a chain of ``@wp.func`` helpers must load
-        successfully under ``max_workers > 1``. Without the codegen
-        lock at least one of the ``ATTEMPTS`` parallel CUDA builds
-        raises because the shared helpers' adjoints were clobbered
-        mid-build."""
+        """Load parallel modules that share a chain of Warp functions.
+
+        Without the code-generation lock, at least one of the ``ATTEMPTS`` CUDA
+        builds raises because the shared helpers' adjoints are clobbered mid-build.
+        """
         device = wp.get_preferred_device()
         for attempt in range(self.ATTEMPTS):
             modules = self._build_kernels(attempt)
@@ -364,9 +424,10 @@ class TestParallelLoadSharedHelper(unittest.TestCase):
             _assert_modules_loaded_on_cuda(self, modules, device)
 
     def test_force_load_parallel_with_shared_func_high_concurrency(self):
-        """Same race but with more modules than worker threads, so the
-        ``ThreadPoolExecutor`` queues tasks and reuses workers between
-        builds."""
+        """Load more shared-function modules than parallel worker threads.
+
+        Make ``ThreadPoolExecutor`` queue tasks and reuse workers between builds.
+        """
         device = wp.get_preferred_device()
         max_workers = max(2, self.NUM_MODULES // 2)
         for attempt in range(self.ATTEMPTS):

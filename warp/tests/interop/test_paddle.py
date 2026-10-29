@@ -129,6 +129,10 @@ def test_paddle_zerocopy(test, device):
     t = wp.to_paddle(a)
     assert a.ptr == t.data_ptr()
 
+    a = wp.zeros(10, dtype=wp.float32, device=device, requires_grad=True)
+    t = wp.to_paddle(a)
+    test.assertEqual(a.grad.ptr, t.grad.data_ptr())
+
     paddle_device = wp.device_to_paddle(device)
 
     t = paddle.zeros([10], dtype=paddle.float32).to(device=paddle_device)
@@ -547,7 +551,7 @@ def test_from_paddle_zero_strides(test, device):
 
 
 def test_paddle_retain_grad_from_paddle(test, device):
-    """Test that retain_grad can be set when converting from Paddle via from_paddle"""
+    """Test that ``retain_grad`` can be set after conversion from Paddle."""
     paddle = _import_paddle()
 
     paddle_device = wp.device_to_paddle(device)
@@ -562,7 +566,7 @@ def test_paddle_retain_grad_from_paddle(test, device):
 
 
 def test_paddle_autograd(test, device):
-    """Test paddle autograd with a custom Warp op"""
+    """Test Paddle autograd with a custom Warp operation."""
 
     paddle = _import_paddle()
 
@@ -635,7 +639,7 @@ def test_paddle_autograd(test, device):
 
 
 def test_warp_graph_warp_stream(test, device):
-    """Capture Warp graph on Warp stream"""
+    """Capture a Warp graph on a Warp stream."""
 
     paddle = _import_paddle()
 
@@ -669,7 +673,7 @@ def test_warp_graph_warp_stream(test, device):
 
 
 def test_warp_graph_paddle_stream(test, device):
-    """Capture Warp graph on Paddle stream"""
+    """Capture a Warp graph on a Paddle stream."""
 
     wp.load_module(device=device)
 
@@ -709,7 +713,7 @@ def test_warp_graph_paddle_stream(test, device):
 
 
 def test_direct(test, device):
-    """Pass Paddle tensors to Warp kernels directly"""
+    """Pass Paddle tensors directly to Warp kernels."""
 
     paddle = _import_paddle()
 

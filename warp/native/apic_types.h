@@ -10,8 +10,10 @@
 // APIC Format Constants
 // =============================================================================
 
-#define APIC_FORMAT_VERSION 15
-#define APIC_MIN_SUPPORTED_FORMAT_VERSION 13
+#define APIC_FORMAT_VERSION 18
+// Intentionally require recapture rather than decode unbounded legacy relocations.
+#define APIC_MIN_SUPPORTED_FORMAT_VERSION 18
+#define APIC_UNSIGNED_LAUNCH_BOUNDS_VERSION 16
 #define APIC_MAGIC "WRP1"
 #define APIC_MAGIC_VALUE 0x31505257  // "WRP1" as little-endian uint32
 
@@ -40,7 +42,7 @@ enum APICOpType : uint32_t {
     APIC_OP_SEGMENTED_SORT = 11,  // wp.utils.segmented_sort_pairs
     APIC_OP_RADIX_SORT = 12,  // wp.utils.radix_sort_pairs
     APIC_OP_RUNLENGTH_ENCODE = 13,  // wp.utils.runlength_encode
-    APIC_OP_BSR_FROM_TRIPLETS = 14,  // wp_bsr_matrix_from_triplets_host
+    APIC_OP_BSR_FROM_TRIPLETS = 14,  // wp_bsr_matrix_from_triplets_host/device
     APIC_OP_BSR_TRANSPOSE = 15,  // wp_bsr_transpose_host
     APIC_OP_REDUCTION = 16,
     APIC_OP_BVH_REFIT = 17,  // wp_bvh_refit_host
@@ -71,6 +73,28 @@ enum APICRelocKind : uint8_t {
     APIC_RELOC_DATA_PTR = 1,  // Region pointer: write resolve_ptr(region_id, region_offset).
     APIC_RELOC_HANDLE = 2,  // wp.handle / mesh id: write handle_ptr_remap[region_offset].
     APIC_RELOC_NULL = 3,  // Explicit zero (null array data/grad, absent indexedarray dim).
+};
+
+enum APICCudaBinaryKind : uint8_t {
+    APIC_CUDA_BINARY_NONE = 0,
+    APIC_CUDA_BINARY_PTX = 1,
+    APIC_CUDA_BINARY_CUBIN = 2,
+};
+
+enum APICCudaArchSuffix : uint8_t {
+    APIC_CUDA_ARCH_SUFFIX_NONE = 0,
+    APIC_CUDA_ARCH_SUFFIX_A = 1,
+    APIC_CUDA_ARCH_SUFFIX_F = 2,
+};
+
+enum APICCudaFallbackReason : uint8_t {
+    APIC_CUDA_FALLBACK_AVAILABLE = 0,
+    APIC_CUDA_FALLBACK_SOURCE_UNAVAILABLE = 1,
+    APIC_CUDA_FALLBACK_EXTERNAL_INCLUDES = 2,
+    APIC_CUDA_FALLBACK_LLVM_CUDA = 3,
+    APIC_CUDA_FALLBACK_LINK_INPUTS = 4,
+    APIC_CUDA_FALLBACK_EXPORT_FAILED = 5,
+    APIC_CUDA_FALLBACK_RECIPE_UNAVAILABLE = 6,
 };
 
 // =============================================================================
@@ -113,6 +137,21 @@ struct APICSectionEntry {
     uint64_t size;  // Section size (compressed)
     uint64_t uncompressed_size;  // Uncompressed size
 };  // 32 bytes
+
+// Semantic NVRTC options needed to reproduce generated CUDA source on a guest.
+// Target architecture and output kind are selected by the guest; PCH and
+// tracing are guest-owned policy and intentionally omitted.
+struct APICCudaCompileRecipe {
+    uint8_t debug;
+    uint8_t optimization_level;
+    uint8_t verify_fp;
+    uint8_t fast_math;
+    uint8_t fuse_fp;
+    uint8_t lineinfo;
+    uint8_t arch_suffix;  // APICCudaArchSuffix
+    uint8_t _reserved[9];
+};  // 16 bytes
+static_assert(sizeof(APICCudaCompileRecipe) == 16, "APICCudaCompileRecipe must remain 16 bytes");
 
 // =============================================================================
 // Mesh Serialization Records
@@ -174,7 +213,7 @@ struct APICLaunchRecord {
 
     // Generated kernel launch bounds (embedded). Stores the shape and dimensionality
     // used by launch_bounds_t<N>, not necessarily the original Python wp.launch() rank.
-    int32_t shape[APIC_LAUNCH_MAX_DIMS];  // Shape passed to the generated kernel entry point
+    uint32_t shape[APIC_LAUNCH_MAX_DIMS];  // Shape passed to the generated kernel entry point
     int32_t ndim;  // Kernel dimensionality used to select launch_bounds_t<N>
     uint64_t size;  // Total threads, including any folded launch axes
 
@@ -286,6 +325,7 @@ struct APICMemtileRecord {
     uint64_t count;  // number of elements
     // followed by srcsize bytes of inline value data
 };  // 32 bytes fixed
+static_assert(sizeof(APICMemtileRecord) == 32, "APICMemtileRecord must remain 32 bytes");
 
 // In-graph allocation (fixed size)
 struct APICAllocRecord {
@@ -393,17 +433,17 @@ struct APICRunlengthEncodeRecord {
     uint8_t _pad[4];
 };
 
-// BSR-from-triplets op. Records a wp_bsr_matrix_from_triplets_host() call so
+// BSR-from-triplets op. Records a wp_bsr_matrix_from_triplets_host/device() call so
 // replay recomputes the matrix topology (bsr_offsets/bsr_columns and the
 // per-triplet summed_block offsets/indices that the recorded
 // _bsr_accumulate_triplet_values kernel reads) from the current (replay-time)
-// triplets. Same rationale as the sorts/runlength-encode: on CPU the topology
-// is computed by a host function that, unlike a kernel launch, is otherwise
-// invisible to the byte stream — so without this op the topology stays frozen
-// at the capture-time (deferred/empty) triplet data. Region ids are -1 for the
-// optional pointers (tpl_nnz, tpl_values, bsr_row_counts, bsr_nnz) when absent.
-// Buffer sizes derive from ``nnz_upper_bound`` (the triplet count) and the
-// scalar fields.
+// triplets. On CPU the host function would otherwise be invisible to the byte
+// stream; on CUDA the semantic record is needed to reconstruct the native CUB
+// work when loading a saved graph. Region ids are -1 for the
+// optional pointers (tpl_nnz, tpl_values, bsr_row_counts) when absent. The
+// bsr_nnz fields are unused by new captures and remain in the record so formats
+// 13 through 15 retain their original layout. Buffer sizes derive from
+// ``nnz_upper_bound`` (the triplet count) and the scalar fields.
 struct APICBsrFromTripletsRecord {
     APICOpHeader header;  // op_type = APIC_OP_BSR_FROM_TRIPLETS
     int32_t block_size;
@@ -423,7 +463,7 @@ struct APICBsrFromTripletsRecord {
     int32_t bsr_offsets_region_id;
     int32_t bsr_row_counts_region_id;  // -1 if absent
     int32_t bsr_columns_region_id;
-    int32_t bsr_nnz_region_id;  // -1 if absent
+    int32_t bsr_nnz_region_id;  // legacy, always -1 in new captures
     uint64_t tpl_nnz_offset;
     uint64_t tpl_rows_offset;
     uint64_t tpl_columns_offset;
@@ -433,7 +473,7 @@ struct APICBsrFromTripletsRecord {
     uint64_t bsr_offsets_offset;
     uint64_t bsr_row_counts_offset;
     uint64_t bsr_columns_offset;
-    uint64_t bsr_nnz_offset;
+    uint64_t bsr_nnz_offset;  // legacy, always 0 in new captures
 };
 
 // BSR-transpose op. Records a wp_bsr_transpose_host() call so replay recomputes

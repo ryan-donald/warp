@@ -62,10 +62,12 @@ Examples `00` and `01` follow this two-phase workflow.
 ```python
 import warp as wp
 
+
 @wp.kernel
 def my_kernel(x: wp.array(dtype=wp.float32)):
     tid = wp.tid()
     x[tid] = x[tid] * 2.0
+
 
 wp.init()
 wp.compile_aot_module("__main__", module_dir="generated/", strip_hash=True)
@@ -106,6 +108,11 @@ my_kernel_cuda_kernel_forward<<<grid, block>>>(dim, arr_x);
 
 Examples `02` and `03` use `wp.capture_begin(..., apic=True)` and `wp.capture_save()` to write a `.wrp` file plus a companion `_modules` directory. The standalone C++ application loads both artifacts through the APIC API. The CUDA example reconstructs a CUDA graph for replay; the CPU example directly interprets the recorded operation stream.
 
+Both examples link against Warp's native shared libraries at build time. Their
+CMake files model Windows DLLs and import libraries as imported shared targets.
+The CPU example uses `warp_clang.h` to bind the core CPU block runtime and to
+load modules and look up symbols through `warp-clang`.
+
 ## Key Concepts
 
 ### Warp AOT Header
@@ -131,7 +138,7 @@ These examples are designed to run from within the Warp repository.
 
 ### Requirements
 
-- **Python 3.10+**
+- **Python 3.11+**
 - **CUDA Toolkit and NVIDIA GPU** for examples `00`, `01`, and `02`:
   - `00_cubin_launch` and `02_apic_visualization`: **12.0+**
   - `01_source_include`: **12.8+** (required for `sm_120` compilation)

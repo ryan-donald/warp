@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# TODO: add more tests for kernels and generics
-
 import itertools
 import os
 import subprocess
@@ -402,8 +400,68 @@ class TestModuleHasherKernelOptions(unittest.TestCase):
         self.assertNotEqual(make(2).module.hash_module(), make(4).module.hash_module())
         self.assertEqual(make(2).module.hash_module(), make(2).module.hash_module())
 
+    def test_cuda_max_registers_hashed(self):
+        """Verify distinct ``cuda_max_registers`` values produce different module hashes."""
+
+        def make(cuda_max_registers):
+            @wp.kernel(cuda_max_registers=cuda_max_registers, module="unique")
+            def k(a: wp.array[int]):
+                a[wp.tid()] = 0
+
+            return k
+
+        self.assertNotEqual(make(32).module.hash_module(), make(64).module.hash_module())
+        self.assertEqual(make(32).module.hash_module(), make(32).module.hash_module())
+
 
 class TestModuleHashing(unittest.TestCase):
+    def test_builtin_adjoint_dispatch_affects_module_hash(self):
+        """Changes to a native adjoint call must invalidate cached kernels."""
+
+        @wp.kernel(module="unique")
+        def reduce_axis(x: wp.array2d[float], y: wp.array[float]):
+            values = wp.tile_load(x, shape=(2, 3), storage="shared")
+            wp.tile_store(y, wp.tile_sum(values, axis=0))
+
+        tile_sum = wp._src.context.builtin_functions["tile_sum"]
+        axis_overload = next(overload for overload in tile_sum.overloads if "axis" in overload.input_types)
+        original_native_func = axis_overload.native_func
+        original_flag = axis_overload.adjoint_uses_template_args
+        original_hash = reduce_axis.module.hash_module()
+
+        try:
+            axis_overload.native_func = f"{original_native_func}_changed"
+            self.assertNotEqual(reduce_axis.module.hash_module(), original_hash)
+
+            axis_overload.native_func = original_native_func
+            axis_overload.adjoint_uses_template_args = not original_flag
+            self.assertNotEqual(reduce_axis.module.hash_module(), original_hash)
+        finally:
+            axis_overload.native_func = original_native_func
+            axis_overload.adjoint_uses_template_args = original_flag
+
+    def test_inline_hint_hashed(self):
+        """Verify each ``@wp.func`` inline hint produces a distinct module hash.
+
+        The hint changes only the generated C++/CUDA, not the Python source, so without it in
+        the key a shared kernel cache would serve a binary built for a different hint.
+        """
+
+        def make(inline):
+            @wp.func(inline=inline, module="unique")
+            def f(x: float) -> float:
+                return x + 1.0
+
+            @wp.kernel(enable_backward=False, module=f.module)
+            def k(a: wp.array[float]):
+                a[wp.tid()] = f(1.0)
+
+            return f.module
+
+        hashes = {make(inline=inline).hash_module() for inline in (None, False, True)}
+        self.assertEqual(len(hashes), 3)
+        self.assertEqual(make(inline=False).hash_module(), make(inline=False).hash_module())
+
     def test_unique_module_import_hash_before_explicit_init(self):
         """Verify unique-module hashing before explicit ``wp.init()``."""
         code = (

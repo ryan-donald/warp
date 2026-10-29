@@ -7,10 +7,14 @@ import ctypes
 import gc
 import os
 import struct
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 import weakref
 from functools import partial
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -18,8 +22,24 @@ import numpy as np
 import warp as wp
 import warp._src.context as wp_context
 from warp._src.apic.capture import APICapture
+from warp._src.apic.types import (
+    APIC_CUDA_ARCH_SUFFIX_A,
+    APIC_CUDA_BINARY_CUBIN,
+    APIC_CUDA_BINARY_NONE,
+    APIC_CUDA_BINARY_PTX,
+    APIC_CUDA_FALLBACK_AVAILABLE,
+    APIC_CUDA_FALLBACK_SOURCE_UNAVAILABLE,
+    APICCudaCompileRecipe,
+)
 from warp.sparse import (
     BSR_STATUS_ROW_CAPACITY_EXCEEDED,
+    bsr_assign,
+    bsr_axpy,
+    bsr_axpy_work_arrays,
+    bsr_copy,
+    bsr_from_triplets,
+    bsr_mm,
+    bsr_mm_work_arrays,
     bsr_set_from_triplets,
     bsr_set_transpose,
     bsr_zeros,
@@ -41,6 +61,12 @@ def scale_kernel(input: wp.array[float], output: wp.array[float], s: float):
 
 
 @wp.kernel
+def scale_2d_kernel(input: wp.array2d[float], output: wp.array2d[float], s: float):
+    i, j = wp.tid()
+    output[i, j] = input[i, j] * s
+
+
+@wp.kernel
 def add_kernel(a: wp.array[float], b: wp.array[float], output: wp.array[float]):
     i = wp.tid()
     output[i] = a[i] + b[i]
@@ -54,6 +80,11 @@ def fill_reduction_inputs_kernel(a: wp.array[wp.float32], b: wp.array[wp.float32
 
 
 @wp.kernel
+def no_tid_kernel():
+    pass
+
+
+@wp.kernel
 def bvh_query_aabb_hits(bvh: wp.uint64, lower: wp.vec3, upper: wp.vec3, hits: wp.array(dtype=wp.int32)):
     # Marks hits[i] = 1 for every BVH primitive whose bounds overlap [lower, upper].
     query = wp.bvh_query_aabb(bvh, lower, upper)
@@ -62,13 +93,811 @@ def bvh_query_aabb_hits(bvh: wp.uint64, lower: wp.vec3, upper: wp.vec3, hits: wp
         hits[index] = 1
 
 
+# A separate module keeps the MathDx LTO build out of every other CUDA test.
+@wp.kernel(module="unique", enable_backward=False)
+def apic_mathdx_matmul_kernel(a: wp.array2d[float], b: wp.array2d[float], c: wp.array2d[float]):
+    tile_a = wp.tile_load(a, shape=(16, 16))
+    tile_b = wp.tile_load(b, shape=(16, 16))
+    wp.tile_store(c, wp.tile_matmul(tile_a, tile_b))
+
+
 class TestApic(unittest.TestCase):
-    pass
+    def test_capture_load_initializes_warp(self):
+        """Call wp.capture_load() in a fresh process before Warp is initialized."""
+        script = textwrap.dedent(
+            """
+            import warp as wp
+
+            try:
+                wp.capture_load("missing_graph", device="cpu")
+            except RuntimeError as e:
+                print("RuntimeError:", e)
+            """
+        )
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RuntimeError: Failed to load APIC graph from missing_graph.wrp", result.stdout)
+
+    def test_capture_save_does_not_publish_failed_exports(self):
+        """Keep failed writes and registrations out of the destination artifact."""
+        for failure in ("binary", "source", "mesh", "native"):
+            for source_fallback in (False, True):
+                if failure == "source" and not source_fallback:
+                    continue
+                for overwrite in (False, True):
+                    with (
+                        self.subTest(failure=failure, source_fallback=source_fallback, overwrite=overwrite),
+                        tempfile.TemporaryDirectory() as tmpdir,
+                    ):
+                        module = _mock_apic_cuda_export_module(tmpdir, "test.cuda_module", "module")
+                        with open(os.path.join(tmpdir, "module.meta"), "wb") as meta_file:
+                            meta_file.write(b"new metadata")
+                        graph = _mock_apic_cuda_export_graph({"module_hash": module})
+                        graph._apic_capture.collected_mesh_ids = {1}
+                        path = os.path.join(tmpdir, "capture")
+                        if overwrite:
+                            _mock_apic_existing_export(path, module)
+                        original = _snapshot_apic_export(path)
+                        original_entries = set(os.listdir(tmpdir))
+                        copy2 = wp_context.shutil.copy2
+
+                        def copy_module(src, dst, failure=failure, copy2=copy2):
+                            if failure == "binary" and dst.endswith(".ptx"):
+                                with open(dst, "wb") as module_file:
+                                    module_file.write(b"partial module")
+                                raise OSError("injected module copy failure")
+                            return copy2(src, dst)
+
+                        def open_export(filename, mode="r", *args, failure=failure, **kwargs):
+                            if failure == "source" and mode == "wb" and os.fsdecode(filename).endswith(".cu"):
+                                with open(filename, "wb") as source_file:
+                                    source_file.write(b"partial source")
+                                raise OSError("injected source write failure")
+                            return open(filename, mode, *args, **kwargs)
+
+                        def save_graph(state, filename, target_arch, context, failure=failure):
+                            if failure == "native":
+                                with open(filename, "wb") as wrp_file:
+                                    wrp_file.write(b"partial capture")
+                                return False
+                            return _mock_apic_state_save(state, filename, target_arch, context)
+
+                        with (
+                            mock.patch.object(wp_context, "runtime") as runtime,
+                            mock.patch.object(wp_context.shutil, "copy2", side_effect=copy_module),
+                            mock.patch.object(wp_context, "open", side_effect=open_export, create=True),
+                        ):
+                            runtime.core.wp_apic_register_mesh.return_value = failure != "mesh"
+                            runtime.core.wp_apic_state_save.side_effect = save_graph
+                            with self.assertRaises((OSError, RuntimeError)):
+                                wp.capture_save(graph, path, source_fallback=source_fallback)
+                        self.assertEqual(_snapshot_apic_export(path), original)
+                        self.assertEqual(set(os.listdir(tmpdir)), original_entries)
+                        if not overwrite:
+                            self.assertFalse(os.path.exists(path + ".wrp"))
+                            self.assertFalse(os.path.exists(path + "_modules"))
+
+    def test_capture_save_restores_existing_export_on_publication_failure(self):
+        """Roll back companion-directory replacement if publication fails."""
+        for failure in ("backup", "modules", "graph"):
+            for overwrite in (False, True):
+                if failure == "backup" and not overwrite:
+                    continue
+                with self.subTest(failure=failure, overwrite=overwrite), tempfile.TemporaryDirectory() as tmpdir:
+                    module = _mock_apic_cuda_export_module(tmpdir, "test.cuda_module", "module")
+                    graph = _mock_apic_cuda_export_graph({"module_hash": module})
+                    path = os.path.join(tmpdir, "capture")
+                    if overwrite:
+                        _mock_apic_existing_export(path, module)
+                    original = _snapshot_apic_export(path)
+                    original_entries = set(os.listdir(tmpdir))
+                    replace = os.replace
+
+                    def publish(src, dst, failure=failure, path=path, replace=replace):
+                        if (
+                            (failure == "backup" and src == path + "_modules")
+                            or (failure == "modules" and os.path.basename(src) == "capture_modules")
+                            or (failure == "graph" and dst == path + ".wrp")
+                        ):
+                            raise OSError("injected publication failure")
+                        return replace(src, dst)
+
+                    with (
+                        mock.patch.object(wp_context, "runtime") as runtime,
+                        mock.patch.object(wp_context.os, "replace", side_effect=publish),
+                    ):
+                        runtime.core.wp_apic_state_save.side_effect = _mock_apic_state_save
+                        with self.assertRaisesRegex(OSError, "injected publication failure"):
+                            wp.capture_save(graph, path, source_fallback=True)
+                    self.assertEqual(_snapshot_apic_export(path), original)
+                    self.assertEqual(set(os.listdir(tmpdir)), original_entries)
+                    if not overwrite:
+                        self.assertFalse(os.path.exists(path + ".wrp"))
+                        self.assertFalse(os.path.exists(path + "_modules"))
+
+    def test_capture_save_preserves_existing_export_on_native_failure(self):
+        """Keep both artifact components intact when native serialization fails."""
+        for source_fallback in (False, True):
+            with self.subTest(source_fallback=source_fallback), tempfile.TemporaryDirectory() as tmpdir:
+                module = _mock_apic_cuda_export_module(tmpdir, "test.cuda_module", "module")
+                graph = _mock_apic_cuda_export_graph({"module_hash": module})
+                path = os.path.join(tmpdir, "existing")
+                _mock_apic_existing_export(path, module)
+                original = _snapshot_apic_export(path)
+
+                def fail_native_save(_state, wrp_path, _target_arch, _context):
+                    with open(wrp_path, "wb") as wrp_file:
+                        wrp_file.write(b"partial capture")
+                    return False
+
+                with mock.patch.object(wp_context, "runtime") as runtime:
+                    runtime.core.wp_apic_state_save.side_effect = fail_native_save
+                    with self.assertRaisesRegex(RuntimeError, "Failed to save APIC graph"):
+                        wp.capture_save(graph, path, source_fallback=source_fallback)
+                self.assertEqual(_snapshot_apic_export(path), original)
+
+    def test_capture_save_keeps_recovery_copy_when_rollback_fails(self):
+        """Retain the old modules if a second filesystem error prevents rollback."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            module = _mock_apic_cuda_export_module(tmpdir, "test.cuda_module", "module")
+            graph = _mock_apic_cuda_export_graph({"module_hash": module})
+            path = os.path.join(tmpdir, "capture")
+            _mock_apic_existing_export(path, module)
+            original = _snapshot_apic_export(path)
+            replace = os.replace
+
+            def publish(src, dst):
+                if dst == path + ".wrp" or (src == path + "_modules" and os.path.basename(dst) == "capture_modules"):
+                    raise OSError("injected publication and rollback failure")
+                return replace(src, dst)
+
+            with (
+                mock.patch.object(wp_context, "runtime") as runtime,
+                mock.patch.object(wp_context.os, "replace", side_effect=publish),
+            ):
+                runtime.core.wp_apic_state_save.side_effect = _mock_apic_state_save
+                with self.assertRaisesRegex(RuntimeError, "Recovery files have been preserved") as raised:
+                    wp.capture_save(graph, path, source_fallback=True)
+            recovery_dirs = [entry for entry in os.listdir(tmpdir) if entry.startswith(".warp-apic-")]
+            self.assertEqual(len(recovery_dirs), 1)
+            recovery_dir = os.path.join(tmpdir, recovery_dirs[0])
+            self.assertIn(recovery_dir, str(raised.exception))
+            with open(path + ".wrp", "rb") as wrp_file:
+                self.assertEqual(wrp_file.read(), original[".wrp"])
+            self.assertEqual(
+                _snapshot_apic_export(os.path.join(recovery_dir, "previous")),
+                {name: data for name, data in original.items() if name != ".wrp"},
+            )
+
+    def test_capture_save_binary_only_skips_source_validation(self):
+        """Ignore unavailable CUDA source artifacts unless fallback is requested."""
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit), tempfile.TemporaryDirectory() as tmpdir:
+                module = _mock_apic_cuda_export_module(tmpdir, "test.cuda_module", "module")
+                module["cuda_compile_artifact"] = {
+                    "fallback_reason": "external_includes",
+                    "recipe": None,
+                    "source_path": None,
+                }
+                graph = _mock_apic_cuda_export_graph({"module_hash": module})
+                path = os.path.join(tmpdir, "binary_only")
+                kwargs = {"source_fallback": False} if explicit else {}
+                with (
+                    mock.patch.object(wp_context, "runtime") as runtime,
+                    mock.patch.object(wp_context, "log_warning") as warning,
+                ):
+                    runtime.core.wp_apic_state_save.side_effect = _mock_apic_state_save
+                    wp.capture_save(graph, path, **kwargs)
+                    runtime.core.wp_apic_state_save.assert_called_once()
+                    warning.assert_not_called()
+                self.assertEqual(os.listdir(path + "_modules"), [module["binary_filename"]])
+
+    def test_capture_save_source_fallback_rejects_unavailable_artifacts(self):
+        """Reject incomplete CUDA source artifacts before publishing a capture."""
+        cases = (
+            ("missing artifact", None, "the exact source compile recipe is unavailable"),
+            ("missing recipe", {"recipe": None}, "compile recipe is invalid (missing recipe)"),
+            ("incomplete recipe", {"recipe": {"debug": False}}, "compile recipe is invalid ('verify_fp')"),
+            (
+                "malformed recipe",
+                {"recipe_updates": {"optimization_level": "invalid"}},
+                "compile recipe is invalid (invalid optimization level)",
+            ),
+            (
+                "invalid optimization level",
+                {"recipe_updates": {"optimization_level": 4}},
+                "compile recipe is invalid (invalid optimization level)",
+            ),
+            (
+                "invalid boolean",
+                {"recipe_updates": {"fast_math": "false"}},
+                "compile recipe is invalid (invalid fast_math)",
+            ),
+            ("invalid blocker metadata", {"fallback_reason": []}, "the exact source compile recipe is unavailable"),
+            ("unsafe source filename", {"source_filename": "../module.cu"}, "the source filename is invalid"),
+            (
+                "invalid architecture suffix",
+                {"arch_suffix": "a"},
+                "compile recipe is invalid (invalid architecture suffix for the module target)",
+            ),
+            ("missing source path", {"source_path": None}, "no generated source path was recorded"),
+            ("missing source file", {"source_path": "missing.cu"}, "the source file is unavailable ("),
+            ("missing source identity", {"source_stat": None}, "was missing when the module was loaded"),
+            ("mismatched source identity", {"source_stat": (0, 0, 0, 0, 0)}, "changed after the module was loaded"),
+            (
+                "unverified binary",
+                {"fallback_reason": "unverified_binary"},
+                "strip_hash=True or the binary name does not match its hashed module identifier",
+            ),
+        )
+
+        for name, changes, reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                module = _mock_apic_cuda_export_module(tmpdir, "test.cuda_module", "module")
+                artifact = module["cuda_compile_artifact"]
+                if changes is None:
+                    module["cuda_compile_artifact"] = None
+                elif "recipe_updates" in changes:
+                    artifact["recipe"].update(changes["recipe_updates"])
+                else:
+                    artifact.update(changes)
+                graph = _mock_apic_cuda_export_graph({"module_hash": module})
+                path = os.path.join(tmpdir, "rejected")
+
+                with mock.patch.object(wp_context, "runtime") as runtime:
+                    with self.assertRaises(RuntimeError) as raised:
+                        wp.capture_save(graph, path, source_fallback=True)
+                    self.assertIn("test.cuda_module", str(raised.exception))
+                    self.assertIn(reason, str(raised.exception))
+                    runtime.core.wp_apic_state_save.assert_not_called()
+                self.assertFalse(os.path.exists(path + ".wrp"))
+                self.assertFalse(os.path.exists(path + "_modules"))
+
+    def test_capture_save_source_fallback_detects_source_changes(self):
+        """Reject changed shared source without damaging an existing export."""
+        cases = (
+            ("overwrite", "changed after the module was loaded"),
+            ("replace", "changed after the module was loaded"),
+            # Same bytes, size, and times: only the file identity reveals the replacement.
+            ("replace with preserved times", "changed after the module was loaded"),
+            ("remove", "the source file is unavailable ("),
+            ("overwrite during read", "changed while it was being read"),
+            # The open handle keeps reading the original file while the path names a new one.
+            ("replace during read", "changed while it was being read"),
+        )
+        for change, reason in cases:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmpdir:
+                if change == "replace during read" and sys.platform == "win32":
+                    self.skipTest("Windows cannot replace a file that is open for reading")
+                module = _mock_apic_cuda_export_module(tmpdir, "test.cuda_module", "module")
+                graph = _mock_apic_cuda_export_graph({"module_hash": module})
+                path = os.path.join(tmpdir, "capture")
+                _mock_apic_existing_export(path, module)
+                original = _snapshot_apic_export(path)
+                source_path = module["cuda_compile_artifact"]["source_path"]
+
+                def replace_source(source_path=source_path, preserve_times=False):
+                    original_stat = os.stat(source_path)
+                    replacement = source_path + ".replacement"
+                    with open(source_path, "rb") as source_file, open(replacement, "wb") as replacement_file:
+                        replacement_file.write(source_file.read())
+                    if preserve_times:
+                        os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+                    os.replace(replacement, source_path)
+
+                if change == "overwrite":
+                    with open(source_path, "ab") as source_file:
+                        source_file.write(b"// overwritten\n")
+                elif change == "replace":
+                    replace_source()
+                elif change == "replace with preserved times":
+                    replace_source(preserve_times=True)
+                elif change == "remove":
+                    os.remove(source_path)
+
+                def open_source(
+                    filename,
+                    mode="r",
+                    *args,
+                    change=change,
+                    source_path=source_path,
+                    replace_source=replace_source,
+                    **kwargs,
+                ):
+                    source_file = open(filename, mode, *args, **kwargs)
+                    if not change.endswith("during read") or filename != source_path or mode != "rb":
+                        return source_file
+
+                    def read_and_change():
+                        data = source_file.read()
+                        if change == "overwrite during read":
+                            with open(source_path, "ab") as overwritten:
+                                overwritten.write(b"// overwritten during read\n")
+                        else:
+                            replace_source()
+                        return data
+
+                    wrapped = mock.MagicMock(wraps=source_file)
+                    wrapped.__enter__.return_value = wrapped
+                    wrapped.__exit__.side_effect = source_file.__exit__
+                    wrapped.read.side_effect = read_and_change
+                    return wrapped
+
+                with (
+                    mock.patch.object(wp_context, "runtime") as runtime,
+                    mock.patch.object(wp_context, "open", side_effect=open_source, create=True),
+                ):
+                    # Fail clearly if a missed rejection reaches serialization.
+                    runtime.core.wp_apic_state_save.side_effect = AssertionError("the save was not rejected")
+                    with self.assertRaises(RuntimeError) as raised:
+                        wp.capture_save(graph, path, source_fallback=True)
+                    self.assertIn(reason, str(raised.exception))
+                    runtime.core.wp_apic_state_save.assert_not_called()
+                self.assertEqual(_snapshot_apic_export(path), original)
+
+                with mock.patch.object(wp_context, "runtime") as runtime:
+                    runtime.core.wp_apic_state_save.side_effect = _mock_apic_state_save
+                    wp.capture_save(graph, path)
+                self.assertEqual(os.listdir(path + "_modules"), [module["binary_filename"]])
+
+    def test_capture_save_source_fallback_checks_preamble_dependencies(self):
+        """Accept self-contained CUDA source; reject host-only headers and MathDx link inputs."""
+        includes = "external CUDA includes are required"
+        unresolved = "cannot be resolved from bundled headers"
+        link_inputs = "external link inputs are required (generated source declares LTO-IR or fatbin inputs)"
+        marker = wp_context._APIC_LINK_INPUTS_MARKER.encode()
+        # Expected reason, or None when the source is portable.
+        cases = (
+            ("inline", b"__device__ float user_offset(float x) { return x + 1.0f; }\n", None),
+            ("bundled_header", b'#include "builtin.h"\n', None),
+            ("compiler_header", b"#include <cuda_fp16.h>\n", None),
+            ("comment", b'/*\n#include "host-only.h"\n*/\n', None),
+            ("raw_string", b'const char* text = R"tag(\n#include "host-only.h"\n)tag";\n', None),
+            ("host_header", b'#include "C:/host-only/custom.h"\n', includes),
+            ("local_header", b'#include "host-only.h"\n', includes),
+            ("spliced_header", b'#inc\\\nlude "host-only.h"\n', includes),
+            ("commented_header", b'#/**/include "host-only.h"\n', includes),
+            ("macro_header", b"#include HOST_HEADER\n", unresolved),
+            ("lto_marker", b"#define " + marker + b" 1\n", link_inputs),
+            ("commented_lto_marker", b"// #define " + marker + b" 1\n", None),
+            ("lto_gemm", b'extern "C" {\nvoid dot_16_16_16_80(float*, float*);\n}\n', link_inputs),
+            ("lto_fft", b'extern "C" {\nvoid fft_32_80(float*, char*);\n}\n', link_inputs),
+            ("lto_solver", b'extern "C" {\nvoid potrf_16_80(float*, char*);\n}\n', link_inputs),
+            # Declarations as ModuleBuilder emits them: sorted, CRLF on Windows, namespaced parameter types.
+            (
+                "lto_sorted_block",
+                b'extern "C" {\r\nvoid getrf_8_8_1_120_x(wp::float32*, char*);\r\n'
+                b"void potrf_8_8_1_120_x(wp::float32*, wp::float32*, char*);\r\n}\r\n",
+                link_inputs,
+            ),
+            (
+                "lto_later_declaration",
+                b'extern "C" {\nvoid unrelated_symbol(float*);\nvoid trsm_8_8_1_120_x(wp::float32*, char*);\n}\n',
+                link_inputs,
+            ),
+            ("inline_linkage", b'extern "C" {\nvoid inline_function() {}\n}\n', None),
+            ("lto_named_definition", b'extern "C" {\nvoid dot_helper() {}\n}\n', None),
+            ("lto_named_declaration_outside_block", b"void dot_helper(float*);\n", None),
+            ("user_declaration", b'extern "C" { void helper(); }\nvoid helper() {}\n', None),
+            ("commented_lto", b'/* extern "C" {\nvoid dot_16(float*);\n} */\n', None),
+        )
+        for name, source_data, reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                module = _mock_apic_cuda_export_module(tmpdir, "test." + name, name, source_data=source_data)
+                graph = _mock_apic_cuda_export_graph({name: module})
+                path = os.path.join(tmpdir, "capture")
+                with (
+                    mock.patch.object(wp_context, "runtime") as runtime,
+                    mock.patch.object(wp_context, "log_warning") as warning,
+                ):
+                    runtime.core.wp_apic_state_save.side_effect = _mock_apic_state_save
+                    if reason is None:
+                        wp.capture_save(graph, path, source_fallback=True)
+                        runtime.core.wp_apic_state_save.assert_called_once()
+                        with open(os.path.join(path + "_modules", name + ".cu"), "rb") as source_file:
+                            self.assertEqual(source_file.read(), source_data)
+                    else:
+                        with self.assertRaises(RuntimeError) as raised:
+                            wp.capture_save(graph, path, source_fallback=True)
+                        self.assertIn(f"test.{name} ({name}): ", str(raised.exception))
+                        self.assertIn(reason, str(raised.exception))
+                        runtime.core.wp_apic_state_save.assert_not_called()
+                        self.assertFalse(os.path.exists(path + ".wrp"))
+                        self.assertFalse(os.path.exists(path + "_modules"))
+                    warning.assert_not_called()
+
+    def test_capture_save_source_fallback_reports_all_blocked_modules(self):
+        """Report every unavailable CUDA fallback before exporting any module."""
+        marker = wp_context._APIC_LINK_INPUTS_MARKER.encode()
+        link_inputs = "external link inputs are required (generated source declares LTO-IR or fatbin inputs)"
+        # Name, load-time fallback reason, generated source (None for a default stub), expected reason.
+        cases = (
+            ("portable", "available", None, None),
+            ("includes", "external_includes", None, "external CUDA includes are required"),
+            ("link_first", "available", b"#define " + marker + b" 1\n", link_inputs),
+            (
+                "link_second",
+                "available",
+                b'extern "C" {\nvoid fft_32_4_120_forward_5(wp::vec2f*, char*);\n}\n',
+                link_inputs,
+            ),
+            ("llvm", "llvm_cuda", None, "the module used the LLVM CUDA backend"),
+            ("unverified", "unverified_binary", None, "the binary's source compile recipe cannot be verified"),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            modules = {}
+            for name, fallback_reason, source_data, _ in cases:
+                if source_data is None:
+                    module = _mock_apic_cuda_export_module(tmpdir, "test." + name, name)
+                else:
+                    module = _mock_apic_cuda_export_module(tmpdir, "test." + name, name, source_data=source_data)
+                module["cuda_compile_artifact"]["fallback_reason"] = fallback_reason
+                modules[name] = module
+            graph = _mock_apic_cuda_export_graph(modules)
+            path = os.path.join(tmpdir, "rejected")
+
+            with mock.patch.object(wp_context, "runtime") as runtime:
+                with self.assertRaises(RuntimeError) as raised:
+                    wp.capture_save(graph, path, source_fallback=True)
+                message = str(raised.exception)
+                for name, _, _, reason in cases:
+                    if reason is None:
+                        self.assertNotIn(f"test.{name} ", message)
+                    else:
+                        self.assertIn(f"test.{name} ({name}): {reason}", message)
+                runtime.core.wp_apic_state_save.assert_not_called()
+            self.assertFalse(os.path.exists(path + ".wrp"))
+            self.assertFalse(os.path.exists(path + "_modules"))
+
+    def test_capture_save_source_fallback_preserves_existing_export_on_rejection(self):
+        """Leave an existing graph and its modules intact when preflight fails."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            portable = _mock_apic_cuda_export_module(tmpdir, "test.portable", "portable")
+            blocked = _mock_apic_cuda_export_module(tmpdir, "test.blocked", "blocked")
+            blocked["cuda_compile_artifact"]["fallback_reason"] = "external_includes"
+            graph = _mock_apic_cuda_export_graph({"portable": portable, "blocked": blocked})
+            path = os.path.join(tmpdir, "existing")
+            modules_dir = path + "_modules"
+            os.makedirs(modules_dir)
+            existing_files = {
+                path + ".wrp": b"original capture",
+                os.path.join(modules_dir, portable["binary_filename"]): b"original binary",
+                os.path.join(modules_dir, portable["cuda_compile_artifact"]["source_filename"]): b"original source",
+            }
+            for filename, data in existing_files.items():
+                with open(filename, "wb") as artifact_file:
+                    artifact_file.write(data)
+
+            with mock.patch.object(wp_context, "runtime") as runtime:
+                with self.assertRaisesRegex(RuntimeError, r"test.blocked"):
+                    wp.capture_save(graph, path + ".wrp", source_fallback=True)
+                runtime.core.wp_apic_state_save.assert_not_called()
+            self.assertEqual(len(os.listdir(modules_dir)), 2)
+            for filename, data in existing_files.items():
+                with open(filename, "rb") as artifact_file:
+                    self.assertEqual(artifact_file.read(), data)
+
+    def test_snapshot_cuda_compile_artifact_classifies_binaries(self):
+        """Freeze CUDA source identity and classify binary names when a module loads."""
+        module = scale_kernel.module
+        frozen = module.resolve_options(wp.config)
+        module_id = module.get_module_identifier(block_dim=frozen["block_dim"])
+        # Binary name, output architecture, option overrides, expected fallback reason, expected suffix.
+        cases = (
+            (f"{module_id}.sm86.ptx", 86, {}, "available", ""),
+            (f"{module_id}.sm90a.cubin", 90, {}, "available", "a"),
+            (f"{module_id}.sm100f.cubin", 100, {}, "available", "f"),
+            (f"{module_id}.sm86.ptx", 90, {}, "unverified_binary", ""),
+            (f"{module_id}.sm86x.ptx", 86, {}, "unverified_binary", ""),
+            (f"{module_id}.sm86.o", 86, {}, "unverified_binary", ""),
+            ("wp_other_0123456.sm86.ptx", 86, {}, "unverified_binary", ""),
+            (f"{module_id}.sm86.ptx", 86, {"strip_hash": True}, "unverified_binary", ""),
+            (f"{module_id}.sm86.ptx", 86, {"extra_cuda_include_dirs": ("/opt/include",)}, "external_includes", ""),
+            (f"{module_id}.sm86.ptx", 86, {"llvm_cuda": True}, "llvm_cuda", ""),
+        )
+        original_open = open
+        opened_sources = []
+
+        def record_source_open(filename, *args, **kwargs):
+            if isinstance(filename, (str, bytes, os.PathLike)) and os.fsdecode(filename).endswith(".cu"):
+                opened_sources.append(os.fsdecode(filename))
+            return original_open(filename, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = os.path.join(tmpdir, module_id + ".cu")
+            with open(source_path, "wb") as source_file:
+                source_file.write(b"// generated CUDA source\n")
+            source_stat = wp_context._apic_source_identity(os.stat(source_path))
+
+            for binary_name, output_arch, overrides, reason, suffix in cases:
+                with self.subTest(binary=binary_name, output_arch=output_arch, overrides=overrides):
+                    with mock.patch("builtins.open", side_effect=record_source_open):
+                        artifact = module._snapshot_cuda_compile_artifact(
+                            os.path.join(tmpdir, binary_name), output_arch, frozen | overrides
+                        )
+                    self.assertEqual(opened_sources, [])
+                    self.assertEqual(artifact["fallback_reason"], reason)
+                    self.assertEqual(artifact["arch_suffix"], suffix)
+                    self.assertEqual(artifact["source_path"], source_path)
+                    self.assertEqual(artifact["source_stat"], source_stat)
+                    self.assertEqual(artifact["source_filename"], os.path.splitext(binary_name)[0] + ".cu")
+
+            # The live option names the binary, so it must also count when the frozen copy disagrees.
+            with mock.patch.dict(module.options, {"strip_hash": True}):
+                unhashed_id = module.get_module_identifier(block_dim=frozen["block_dim"])
+                artifact = module._snapshot_cuda_compile_artifact(
+                    os.path.join(tmpdir, f"{unhashed_id}.sm86.ptx"), 86, frozen
+                )
+            self.assertEqual(unhashed_id, f"wp_{module.name}")
+            self.assertEqual(artifact["fallback_reason"], "unverified_binary")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            options = frozen | {"mode": "debug", "optimization_level": None}
+            artifact = module._snapshot_cuda_compile_artifact(
+                os.path.join(tmpdir, f"{module_id}.sm86.ptx"), 86, options
+            )
+            self.assertIsNone(artifact["source_stat"])
+            self.assertEqual(artifact["fallback_reason"], "available")
+            self.assertEqual(
+                artifact["recipe"],
+                {
+                    "debug": True,
+                    "optimization_level": 3,
+                    "verify_fp": options["verify_fp"],
+                    "fast_math": options["fast_math"],
+                    "fuse_fp": options["fuse_fp"],
+                    "lineinfo": options["lineinfo"],
+                },
+            )
+
+    def test_module_builder_marks_link_input_source(self):
+        """Mark generated CUDA source only when its binary links LTO-IR or fatbin inputs."""
+        marker = f"#define {wp_context._APIC_LINK_INPUTS_MARKER} 1"
+        module = scale_kernel.module
+        options = module.resolve_options(wp.config) | {"output_arch": None}
+        hasher = wp_context.ModuleHasher((scale_kernel,), options)
+        link_inputs = {
+            "ltoirs": b"lto-ir",
+            "fatbins": b"fatbin",
+            "ltoirs_decl": "void dot_marker_test(float*);",
+        }
+        for link_input in (None, *link_inputs):
+            with self.subTest(link_input=link_input):
+                builder = wp_context.ModuleBuilder(module, options, hasher=hasher)
+                if link_input is not None:
+                    getattr(builder, link_input)["dot_marker_test"] = link_inputs[link_input]
+                source = builder.codegen("cuda")
+                if link_input is None:
+                    self.assertNotIn(marker, source)
+                else:
+                    self.assertIn(marker, source)
+
+    def test_apic_format_and_warp_version_must_match(self):
+        """Reject format and producer versions before loading graph resources."""
+        device = wp.get_device("cpu")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            format_path = os.path.join(tmpdir, "format_version")
+            _save_apic_memory_validation_graph(format_path, device)
+            with open(format_path + ".wrp", "r+b") as wrp_file:
+                wrp_file.seek(4)
+                serialized_version = _APIC_UINT32.unpack(wrp_file.read(_APIC_UINT32.size))[0]
+                self.assertEqual(serialized_version, _APIC_FORMAT_VERSION)
+                wrp_file.seek(4)
+                wrp_file.write(_APIC_UINT32.pack(serialized_version - 1))
+            _assert_apic_load_rejected(self, format_path, device, r"Unsupported WRP version")
+
+            warp_path = os.path.join(tmpdir, "warp_version")
+            _save_apic_memory_validation_graph(warp_path, device)
+            metadata = _read_apic_section(warp_path + ".wrp", _APIC_SECTION_METADATA)
+            producer_size = _APIC_UINT32.unpack_from(metadata, _APIC_UINT32.size)[0]
+            self.assertGreater(producer_size, 0)
+            producer_offset = _APIC_UINT32.size * 2
+            metadata[producer_offset] = ord("0") if metadata[producer_offset] != ord("0") else ord("1")
+            _replace_apic_section(warp_path + ".wrp", _APIC_SECTION_METADATA, metadata)
+            _assert_apic_load_rejected(self, warp_path, device, r"produced by Warp.*loader is Warp")
+
+    def test_native_save_validates_cuda_module_metadata(self):
+        """Reject CUDA module metadata that the matching reader cannot load."""
+
+        valid_digest = b"0" * 64
+        module_hash = b"module_hash"
+
+        cases = (
+            ("invalid binary digest", {"binary_digest": b"invalid"}),
+            (
+                "incomplete source fields",
+                {"source_filename": b"module.cu", "source_digest": b""},
+            ),
+            ("binary kind mismatch", {"binary_kind": APIC_CUDA_BINARY_CUBIN}),
+            ("available fallback without source", {"fallback_reason": APIC_CUDA_FALLBACK_AVAILABLE}),
+            ("invalid recipe", {"recipe_updates": {"optimization_level": 4}}),
+            ("invalid architecture suffix", {"recipe_updates": {"arch_suffix": APIC_CUDA_ARCH_SUFFIX_A}}),
+            (
+                "empty binary digest with source",
+                {
+                    "binary_digest": b"",
+                    "source_filename": b"module.cu",
+                    "source_digest": valid_digest,
+                    "binary_kind": APIC_CUDA_BINARY_NONE,
+                },
+            ),
+            ("empty binary digest with binary kind", {"binary_digest": b"", "binary_kind": APIC_CUDA_BINARY_PTX}),
+            (
+                "empty binary digest with available fallback",
+                {
+                    "binary_digest": b"",
+                    "binary_kind": APIC_CUDA_BINARY_NONE,
+                    "fallback_reason": APIC_CUDA_FALLBACK_AVAILABLE,
+                },
+            ),
+            (
+                "empty binary digest with recipe",
+                {"binary_digest": b"", "binary_kind": APIC_CUDA_BINARY_NONE, "recipe_updates": {"debug": 1}},
+            ),
+        )
+
+        for name, changes in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                state = wp_context.runtime.core.wp_apic_create_state()
+                self.assertTrue(state)
+                try:
+                    wp_context.runtime.core.wp_apic_register_module(
+                        state,
+                        module_hash,
+                        b"test.module",
+                        b"module.ptx",
+                        80,
+                    )
+
+                    recipe = APICCudaCompileRecipe()
+                    for field, value in changes.get("recipe_updates", {}).items():
+                        setattr(recipe, field, value)
+                    wp_context.runtime.core.wp_apic_register_cuda_module_artifacts(
+                        state,
+                        module_hash,
+                        changes.get("binary_digest", valid_digest),
+                        changes.get("source_filename", b""),
+                        changes.get("source_digest", b""),
+                        changes.get("binary_kind", APIC_CUDA_BINARY_PTX),
+                        changes.get("fallback_reason", APIC_CUDA_FALLBACK_SOURCE_UNAVAILABLE),
+                        ctypes.byref(recipe),
+                    )
+
+                    path = os.path.join(tmpdir, "invalid.wrp")
+                    result = wp_context.runtime.core.wp_apic_state_save(state, path.encode(), 80, None)
+                    self.assertFalse(result)
+                    self.assertIn("Cannot save invalid APIC module", wp_context.runtime.get_error_string())
+                    self.assertFalse(os.path.exists(path))
+                finally:
+                    wp_context.runtime.core.wp_apic_destroy_state(state)
+
+        for name, binary_digest, binary_kind in (
+            ("binary_metadata", valid_digest, APIC_CUDA_BINARY_PTX),
+            ("empty_artifact_metadata", b"", APIC_CUDA_BINARY_NONE),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                state = wp_context.runtime.core.wp_apic_create_state()
+                self.assertTrue(state)
+                try:
+                    wp_context.runtime.core.wp_apic_register_module(
+                        state,
+                        module_hash,
+                        b"test.module",
+                        b"module.ptx",
+                        80,
+                    )
+                    recipe = APICCudaCompileRecipe()
+                    wp_context.runtime.core.wp_apic_register_cuda_module_artifacts(
+                        state,
+                        module_hash,
+                        binary_digest,
+                        b"",
+                        b"",
+                        binary_kind,
+                        APIC_CUDA_FALLBACK_SOURCE_UNAVAILABLE,
+                        ctypes.byref(recipe),
+                    )
+
+                    path = os.path.join(tmpdir, "binary_only.wrp")
+                    result = wp_context.runtime.core.wp_apic_state_save(state, path.encode(), 80, None)
+                    self.assertTrue(result, wp_context.runtime.get_error_string())
+                    self.assertTrue(os.path.exists(path))
+                finally:
+                    wp_context.runtime.core.wp_apic_destroy_state(state)
+
+
+def _mock_apic_cuda_export_module(directory, module_name, filename, source_data=b"// generated CUDA source\n"):
+    """Create CUDA artifact metadata for save preflight without requiring a GPU."""
+    source_filename = filename + ".cu"
+    source_path = os.path.join(directory, source_filename)
+    with open(source_path, "wb") as source_file:
+        source_file.write(source_data)
+    binary_filename = filename + ".ptx"
+    binary_path = os.path.join(directory, binary_filename)
+    with open(binary_path, "wb") as binary_file:
+        binary_file.write(b"// compiled PTX\n")
+    return {
+        "module_name": module_name,
+        "binary_filename": binary_filename,
+        "binary_path": binary_path,
+        "module_exec": SimpleNamespace(compile_arch=80),
+        "cuda_compile_artifact": {
+            "source_path": source_path,
+            "source_filename": source_filename,
+            "source_stat": wp_context._apic_source_identity(os.stat(source_path)),
+            "fallback_reason": "available",
+            "arch_suffix": "",
+            "recipe": {
+                "debug": False,
+                "optimization_level": 3,
+                "verify_fp": False,
+                "fast_math": False,
+                "fuse_fp": True,
+                "lineinfo": False,
+            },
+        },
+    }
+
+
+def _mock_apic_existing_export(path, module):
+    """Write distinguishable old artifacts to detect destructive failed saves."""
+    modules_dir = path + "_modules"
+    os.makedirs(modules_dir)
+    files = {
+        path + ".wrp": b"original capture",
+        os.path.join(modules_dir, module["binary_filename"]): b"original binary",
+        os.path.join(modules_dir, module["cuda_compile_artifact"]["source_filename"]): b"original source",
+        os.path.join(modules_dir, "module.meta"): b"original metadata",
+        os.path.join(modules_dir, "apic_guest_cached.ptx"): b"original guest cache",
+    }
+    for filename, data in files.items():
+        with open(filename, "wb") as artifact_file:
+            artifact_file.write(data)
+
+
+def _mock_apic_state_save(_state, path, _target_arch, _context):
+    """Model successful native serialization by writing the requested graph file."""
+    with open(path, "wb") as wrp_file:
+        wrp_file.write(b"complete mock capture")
+    return True
+
+
+def _snapshot_apic_export(path):
+    """Read the graph and companion files for byte-for-byte preservation checks."""
+    snapshot = {}
+    if os.path.isfile(path + ".wrp"):
+        with open(path + ".wrp", "rb") as wrp_file:
+            snapshot[".wrp"] = wrp_file.read()
+    modules_dir = path + "_modules"
+    for root, _directories, filenames in os.walk(modules_dir):
+        for filename in filenames:
+            full_path = os.path.join(root, filename)
+            with open(full_path, "rb") as module_file:
+                snapshot[os.path.relpath(full_path, modules_dir)] = module_file.read()
+    return snapshot
+
+
+def _mock_apic_cuda_export_graph(modules):
+    """Provide the Python graph metadata needed to validate a CUDA export."""
+    return SimpleNamespace(
+        apic=True,
+        apic_state=1,
+        device=SimpleNamespace(is_cuda=True, context=None, get_cuda_compile_arch=lambda: 80),
+        _apic_capture=SimpleNamespace(
+            collected_modules=modules,
+            collected_kernels={},
+            collected_mesh_ids=set(),
+            _regions={},
+        ),
+    )
 
 
 # Must match APICSectionType in warp/native/apic_types.h.
+_APIC_SECTION_METADATA = 1
 _APIC_SECTION_MEMORY = 2
 _APIC_SECTION_OPERATIONS = 3
+_APIC_FORMAT_VERSION = 18
 
 # These layouts mirror the packed structs in warp/native/apic_types.h. "<"
 # selects little-endian standard sizes without implicit alignment; "4s", "i",
@@ -82,11 +911,19 @@ _APIC_SECTION_ENTRY = struct.Struct("<IIQQQ")
 
 # APICMemoryRegionRecord: ID, element size, byte size, initial-data flag, padding.
 _APIC_MEMORY_REGION_RECORD = struct.Struct("<IIQB7x")
+_APIC_OP_HEADER = struct.Struct("<II")
 
 # APICCondRecord: operation type/size, condition region/padding/offset, then each
 # branch's byte size and operation count.
 _APIC_COND_RECORD = struct.Struct("<IIiIQIIII")
+
+# APICMemtileRecord: operation type/size, destination region, inline value size,
+# destination offset, and repetition count.
+_APIC_MEMTILE_RECORD = struct.Struct("<IIiIQQ")
+_APIC_OP_MEMTILE = 10
 _APIC_UINT32 = struct.Struct("<I")  # One serialized uint32_t.
+_APIC_OP_KERNEL_LAUNCH = 1
+_APIC_LAUNCH_SHAPE_OFFSET = _APIC_OP_HEADER.size
 
 
 def _find_apic_section(wrp_data, requested_section_type):
@@ -155,6 +992,26 @@ def _replace_apic_section(path, requested_section_type, replacement):
         wrp_file.truncate()
 
 
+def _replace_first_apic_kernel_shape(path, extent, axis=0):
+    """Replace one extent in the first kernel launch record."""
+    operations = _read_apic_section(path, _APIC_SECTION_OPERATIONS)
+    operation_count = _APIC_UINT32.unpack_from(operations)[0]
+    offset = _APIC_UINT32.size
+    for _ in range(operation_count):
+        operation_type, operation_size = _APIC_OP_HEADER.unpack_from(operations, offset)
+        if operation_type == _APIC_OP_KERNEL_LAUNCH:
+            _APIC_UINT32.pack_into(
+                operations,
+                offset + _APIC_LAUNCH_SHAPE_OFFSET + axis * _APIC_UINT32.size,
+                extent,
+            )
+            _replace_apic_section(path, _APIC_SECTION_OPERATIONS, operations)
+            return
+        offset += operation_size
+
+    raise ValueError("Expected at least one APIC kernel launch")
+
+
 def _append_apic_memory_record(path, record_and_payload):
     """Append one logical memory record to a WRP memory section."""
     memory_section = _read_apic_section(path, _APIC_SECTION_MEMORY)
@@ -218,8 +1075,61 @@ def _corrupt_apic_empty_branch_count(path, branch_name):
         wrp_file.write(_APIC_COND_RECORD.pack(*conditional))
 
 
+def _corrupt_apic_memtile_record(path, *, srcsize=None, count=None):
+    """Corrupt selected fields in a four-byte MEMTILE record."""
+    with open(path, "r+b") as wrp_file:
+        wrp_data = wrp_file.read()
+        section_offset, section_size = _find_apic_section(wrp_data, _APIC_SECTION_OPERATIONS)
+
+        if section_size < _APIC_UINT32.size + _APIC_MEMTILE_RECORD.size:
+            raise ValueError("WRP operations section has no MEMTILE record")
+
+        operation_count = _APIC_UINT32.unpack_from(wrp_data, section_offset)[0]
+        if operation_count != 1:
+            raise ValueError("Expected exactly one operation")
+
+        memtile_offset = section_offset + _APIC_UINT32.size
+        memtile = list(_APIC_MEMTILE_RECORD.unpack_from(wrp_data, memtile_offset))
+        if memtile[0] != _APIC_OP_MEMTILE or memtile[3] != 4:
+            raise ValueError("Expected a four-byte MEMTILE operation")
+
+        if srcsize is not None:
+            memtile[3] = srcsize
+        if count is not None:
+            memtile[5] = count
+        wrp_file.seek(memtile_offset)
+        wrp_file.write(_APIC_MEMTILE_RECORD.pack(*memtile))
+
+
+def _patch_apic_file_header(path, **fields):
+    """Overwrite selected fields of a WRP file's header prefix."""
+    names = ("magic", "version", "flags", "num_sections", "section_table_offset")
+    with open(path, "r+b") as wrp_file:
+        prefix = _APIC_FILE_HEADER_PREFIX.unpack(wrp_file.read(_APIC_FILE_HEADER_PREFIX.size))
+        header = dict(zip(names, prefix, strict=True))
+        header.update(fields)
+        wrp_file.seek(0)
+        wrp_file.write(_APIC_FILE_HEADER_PREFIX.pack(*(header[name] for name in names)))
+
+
+def _patch_apic_section_size(path, section_type, size):
+    """Overwrite the stored size of one WRP section-table entry."""
+    with open(path, "r+b") as wrp_file:
+        wrp_data = wrp_file.read()
+        _, _, _, section_count, section_table_offset = _APIC_FILE_HEADER_PREFIX.unpack_from(wrp_data)
+        for section_index in range(section_count):
+            entry_offset = section_table_offset + _APIC_SECTION_ENTRY.size * section_index
+            entry = list(_APIC_SECTION_ENTRY.unpack_from(wrp_data, entry_offset))
+            if entry[0] == section_type:
+                entry[3] = size
+                wrp_file.seek(entry_offset)
+                wrp_file.write(_APIC_SECTION_ENTRY.pack(*entry))
+                return
+    raise ValueError(f"No WRP section of type {section_type}")
+
+
 def test_save_apic_false_error(test, device):
-    """capture_save() should raise when apic=False."""
+    """Verify that capture_save() should raise when apic=False."""
     n = 64
     a = wp.array(np.ones(n, dtype=np.float32), device=device)
     b = wp.zeros(n, dtype=float, device=device)
@@ -296,6 +1206,34 @@ def test_capture_load_rejects_empty_conditional_branches_with_operations(test, d
                 wp_context.runtime.core.wp_set_error_output_enabled(saved_error_output_enabled)
 
 
+def test_capture_load_rejects_memtile_span_overflow(test, device):
+    """Reject a MEMTILE whose byte-span multiplication overflows."""
+    values = wp.zeros(4, dtype=wp.float32, device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "memtile_span_overflow.wrp")
+        with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+            values.fill_(42.0)
+        wp.capture_save(capture.graph, path, outputs={"values": values})
+        _corrupt_apic_memtile_record(path, count=1 << 62)
+
+        _assert_apic_load_rejected(test, path, device, r"operation stream failed validation")
+
+
+def test_capture_load_rejects_zero_memtile_srcsize(test, device):
+    """Reject a MEMTILE record with a zero-byte source value."""
+    values = wp.zeros(4, dtype=wp.float32, device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "memtile_zero_srcsize.wrp")
+        with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+            values.fill_(42.0)
+        wp.capture_save(capture.graph, path, outputs={"values": values})
+        _corrupt_apic_memtile_record(path, srcsize=0)
+
+        _assert_apic_load_rejected(test, path, device, r"operation stream failed validation")
+
+
 def test_capture_load_rejects_malformed_memory_regions(test, device):
     """Reject malformed APIC memory records before allocating regions.
 
@@ -344,6 +1282,48 @@ def test_capture_load_rejects_malformed_memory_regions(test, device):
             )
 
 
+def test_capture_load_rejects_out_of_bounds_sections(test, device):
+    """Reject section tables, sections, and metadata that extend past their data."""
+
+    def truncate_metadata(path, *, binding):
+        metadata = _read_apic_section(path, _APIC_SECTION_METADATA)
+        producer_size = _APIC_UINT32.unpack_from(metadata, _APIC_UINT32.size)[0]
+        # Version, producer string length, architecture, and five record counts.
+        header_size = 8 * _APIC_UINT32.size + producer_size
+        size = header_size + 2 if binding else header_size - 1
+        _replace_apic_section(path, _APIC_SECTION_METADATA, metadata[:size])
+
+    cases = {
+        "section table offset": (
+            lambda path: _patch_apic_file_header(path, section_table_offset=1 << 40),
+            r"section table is out of bounds",
+        ),
+        "section count": (
+            lambda path: _patch_apic_file_header(path, num_sections=0xFFFFFFFF),
+            r"section table is out of bounds",
+        ),
+        "section size": (
+            lambda path: _patch_apic_section_size(path, _APIC_SECTION_MEMORY, 1 << 40),
+            r"section \d+ is out of bounds",
+        ),
+        "metadata header": (
+            lambda path: truncate_metadata(path, binding=False),
+            r"Invalid APIC metadata header",
+        ),
+        "metadata binding": (
+            lambda path: truncate_metadata(path, binding=True),
+            r"Invalid APIC binding record",
+        ),
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for case, (corrupt, message_pattern) in cases.items():
+            with test.subTest(case=case):
+                path = os.path.join(tmpdir, case.replace(" ", "_") + ".wrp")
+                _save_apic_memory_validation_graph(path, device)
+                corrupt(path)
+                _assert_apic_load_rejected(test, path, device, message_pattern)
+
+
 def test_live_hashgrid_capture_does_not_snapshot_inputs(test, device):
     """Keep live-only HashGrid input regions out of serialized snapshots."""
     base = wp.zeros(4096, dtype=wp.vec3, device=device)
@@ -378,7 +1358,7 @@ def test_live_hashgrid_capture_does_not_snapshot_inputs(test, device):
 
 
 def test_save_single_kernel(test, device):
-    """Capture, save to .wrp, verify file exists."""
+    """Save a kernel graph and verify its WRP file uses the current format version."""
     n = 256
     a = wp.array(np.arange(n, dtype=np.float32), device=device)
     b = wp.zeros(n, dtype=float, device=device)
@@ -394,6 +1374,23 @@ def test_save_single_kernel(test, device):
         wrp_path = path + ".wrp"
         test.assertTrue(os.path.exists(wrp_path), f"WRP file not found: {wrp_path}")
         test.assertGreater(os.path.getsize(wrp_path), 0, "WRP file is empty")
+        with open(wrp_path, "rb") as wrp_file:
+            _, version, _, _, _ = _APIC_FILE_HEADER_PREFIX.unpack_from(wrp_file.read())
+        test.assertEqual(version, _APIC_FORMAT_VERSION)
+
+
+def test_load_accepts_current_oversized_no_tid_launch_shape(test, device):
+    """Accept unsigned oversized extents when the kernel does not use ``wp.tid()``."""
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(no_tid_kernel, dim=2**31 + 1, device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "current_oversized_no_tid_shape")
+        wp.capture_save(capture.graph, path)
+
+        loaded = wp.capture_load(path, device=device)
+        test.assertTrue(loaded.is_loaded)
 
 
 def test_save_load_round_trip(test, device):
@@ -431,8 +1428,469 @@ def test_save_load_round_trip(test, device):
         np.testing.assert_allclose(result.numpy(), expected)
 
 
+def test_load_same_capture_twice(test, device):
+    """Release the first of two loads of one capture and launch the second."""
+    n = 16
+    a = wp.array(np.arange(n, dtype=np.float32), device=device)
+    b = wp.zeros(n, dtype=float, device=device)
+
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(scale_kernel, dim=n, inputs=[a, b, 2.0], device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "loaded_twice")
+        wp.capture_save(capture.graph, path, inputs={"a": a}, outputs={"b": b})
+        first = wp.capture_load(path, device=device)
+        second = wp.capture_load(path, device=device)
+
+    del first
+    gc.collect()
+
+    wp.capture_launch(second)
+    result = wp.zeros(n, dtype=float, device=device)
+    second.get_param("b", result)
+    np.testing.assert_allclose(result.numpy(), np.arange(n, dtype=np.float32) * 2.0)
+
+
+def test_save_load_large_shared_memory(test, device, conditional=False):
+    """Restore a loaded tile kernel's dynamic shared-memory opt-in."""
+    if device.max_shared_memory_per_block <= 64 * 1024:
+        test.skipTest("Requires more than 64 KiB of shared memory per block")
+    if conditional and not wp.is_conditional_graph_supported():
+        test.skipTest("CUDA conditional graph nodes require Toolkit and driver 12.4+")
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def double_tile(src: wp.array2d[float], dst: wp.array2d[float]):
+        tile = wp.tile_load(src, shape=(128, 128), storage="shared")
+        wp.tile_store(dst, wp.tile_map(wp.add, tile, tile))
+
+    values = np.arange(128 * 128, dtype=np.float32).reshape(128, 128)
+    src = wp.array(values, device=device)
+    dst = wp.zeros_like(src)
+    condition = wp.ones(1, dtype=wp.int32, device=device) if conditional else None
+    wp.load_module(module=double_tile.module, device=device, block_dim=64)
+
+    def double_tile_body():
+        wp.launch_tiled(double_tile, dim=[1], inputs=[src, dst], block_dim=64, device=device)
+
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        if conditional:
+            wp.capture_if(condition, on_true=double_tile_body)
+        else:
+            double_tile_body()
+
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(dst.numpy(), values * 2.0)
+    # Save a zeroed output so its initial contents cannot mask a missing launch.
+    dst.zero_()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "large_shared_memory")
+        wp.capture_save(capture.graph, path, inputs={"src": src}, outputs={"dst": dst})
+        loaded = wp.capture_load(path, device=device)
+        wp.capture_launch(loaded)
+        result = wp.empty_like(dst)
+        loaded.get_param("dst", result)
+        np.testing.assert_array_equal(result.numpy(), values * 2.0)
+
+
+def test_save_load_large_shared_memory_backward(test, device):
+    """Restore the backward kernel's larger dynamic shared-memory limit."""
+    if device.max_shared_memory_per_block <= 64 * 1024:
+        test.skipTest("Requires more than 64 KiB of shared memory per block")
+
+    @wp.kernel(module="unique")
+    def copy_tile(src: wp.array2d[float], dst: wp.array2d[float]):
+        tile = wp.tile_load(src, shape=(64, 128), storage="shared")
+        wp.tile_store(dst, tile)
+
+    # The forward kernel uses 32 KiB, while its backward kernel uses 64 KiB.
+    values = np.arange(64 * 128, dtype=np.float32).reshape(64, 128)
+    src = wp.zeros((64, 128), dtype=float, device=device)
+    dst = wp.zeros_like(src)
+    src_grad = wp.zeros_like(src)
+    dst_grad = wp.array(values, device=device)
+    wp.load_module(module=copy_tile.module, device=device, block_dim=64)
+
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch_tiled(
+            copy_tile,
+            dim=[1],
+            inputs=[src, dst],
+            adj_inputs=[src_grad, dst_grad],
+            adjoint=True,
+            block_dim=64,
+            device=device,
+        )
+
+    wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(src_grad.numpy(), values)
+    src_grad.zero_()
+    # The live backward launch consumes its incoming output gradient.
+    dst_grad.assign(values)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "large_shared_memory_backward")
+        wp.capture_save(capture.graph, path, inputs={"dst_grad": dst_grad}, outputs={"src_grad": src_grad})
+        loaded = wp.capture_load(path, device=device)
+        wp.capture_launch(loaded)
+        result = wp.empty_like(src_grad)
+        loaded.get_param("src_grad", result)
+        np.testing.assert_array_equal(result.numpy(), values)
+
+
+def test_save_load_block_dependent_static_kernel(test, device):
+    """Serialize the selected executable's symbols after switching block sizes."""
+
+    @wp.func
+    def write_tile_length(tile_length_out: wp.array[int]):
+        tile = wp.tile(1)
+        tile_length_out[0] = wp.static(len(tile))
+
+    @wp.kernel(module="unique", enable_backward=False)
+    def tile_length_kernel(tile_length_out: wp.array[int]):
+        write_tile_length(tile_length_out)
+
+    tile_length_out = wp.zeros(1, dtype=int, device=device)
+    wp.launch(tile_length_kernel, dim=1, inputs=[tile_length_out], block_dim=256, device=device)
+    wp.launch(tile_length_kernel, dim=1, inputs=[tile_length_out], block_dim=64, device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(tile_length_kernel, dim=1, inputs=[tile_length_out], block_dim=256, device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        capture_path = os.path.join(tmpdir, "block_dependent_static")
+        wp.capture_save(capture.graph, capture_path, outputs={"tile_length": tile_length_out})
+        loaded_graph = wp.capture_load(capture_path, device=device)
+        wp.capture_launch(loaded_graph)
+        loaded_graph.get_param("tile_length", tile_length_out)
+        np.testing.assert_array_equal(tile_length_out.numpy(), [256])
+
+
+def test_cuda_source_fallback_and_guest_cache(test, device):
+    """Compile a rejected packaged binary from source, then reuse its guest cache."""
+    n = 64
+    a = wp.array(np.arange(n, dtype=np.float32), device=device)
+    b = wp.zeros(n, dtype=float, device=device)
+
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(scale_kernel, dim=n, inputs=[a, b, 2.0], device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "source_fallback")
+        wp.capture_save(capture.graph, path, inputs={"a": a}, outputs={"b": b}, source_fallback=True)
+
+        module_info = next(iter(capture.graph._apic_capture.collected_modules.values()))
+        artifact = module_info["cuda_compile_artifact"]
+        test.assertIsNotNone(artifact)
+        test.assertEqual(
+            artifact["source_filename"],
+            os.path.splitext(module_info["binary_filename"])[0] + ".cu",
+        )
+        modules_dir = path + "_modules"
+        packaged_binary = os.path.join(modules_dir, module_info["binary_filename"])
+        source_path = os.path.join(modules_dir, artifact["source_filename"])
+        test.assertTrue(os.path.isfile(source_path))
+        test.assertFalse(any(name.endswith(".apic.json") for name in os.listdir(modules_dir)))
+
+        # A corrupt packaged binary is recoverable when its validated source is
+        # present. The native resolver must remain quiet and compile in memory.
+        with open(packaged_binary, "wb") as binary_file:
+            binary_file.write(b"intentionally invalid CUDA module")
+
+        loaded = wp.capture_load(path, device=device)
+        wp.capture_launch(loaded)
+        result = wp.zeros(n, dtype=float, device=device)
+        loaded.get_param("b", result)
+        np.testing.assert_allclose(result.numpy(), np.arange(n, dtype=np.float32) * 2.0)
+
+        guest_cache = [name for name in os.listdir(modules_dir) if name.startswith("apic_guest_")]
+        test.assertEqual(len(guest_cache), 1)
+
+        # Cache lookup precedes source access. Removing the source proves the
+        # second load consumes the persistent compiled output without NVRTC.
+        os.remove(source_path)
+        del loaded
+        gc.collect()
+
+        # The binary-only C entry point shares the resolver and may reuse a
+        # previously published guest cache without receiving an include path.
+        native_graph = wp_context.runtime.core.wp_apic_load_graph(
+            device.context,
+            path.encode("utf-8"),
+            0,
+        )
+        test.assertTrue(native_graph, wp_context.runtime.get_error_string())
+        wp_context.runtime.core.wp_apic_destroy_graph(native_graph)
+
+        cached = wp.capture_load(path, device=device)
+        wp.capture_launch(cached)
+        cached.get_param("b", result)
+        np.testing.assert_allclose(result.numpy(), np.arange(n, dtype=np.float32) * 2.0)
+
+
+def test_cuda_packaged_binary_fast_path(test, device):
+    """Load a fresh packaged CUDA binary through both APIC entry points."""
+    n = 64
+    a = wp.array(np.arange(n, dtype=np.float32), device=device)
+    b = wp.zeros(n, dtype=float, device=device)
+
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(scale_kernel, dim=n, inputs=[a, b, 2.0], device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "packaged_binary")
+        wp.capture_save(capture.graph, path, inputs={"a": a}, outputs={"b": b})
+        modules_dir = path + "_modules"
+        test.assertFalse(any(name.endswith(".cu") for name in os.listdir(modules_dir)))
+
+        def assert_no_guest_cache():
+            test.assertFalse(any(name.startswith("apic_guest_") for name in os.listdir(modules_dir)))
+
+        assert_no_guest_cache()
+
+        # Exercise the original standalone entry point before any extended load
+        # has had an opportunity to publish a guest-compiled cache entry.
+        native_graph = wp_context.runtime.core.wp_apic_load_graph(
+            device.context,
+            path.encode("utf-8"),
+            0,
+        )
+        test.assertTrue(native_graph, wp_context.runtime.get_error_string())
+        try:
+            native_exec = wp_context.runtime.core.wp_apic_get_cuda_graph_exec(native_graph)
+            test.assertTrue(native_exec, wp_context.runtime.get_error_string())
+        finally:
+            wp_context.runtime.core.wp_apic_destroy_graph(native_graph)
+        assert_no_guest_cache()
+
+        # Python uses the extended entry point, but a compatible packaged binary
+        # must still win without consulting or populating the guest cache.
+        loaded = wp.capture_load(path, device=device)
+        wp.capture_launch(loaded)
+        result = wp.zeros(n, dtype=float, device=device)
+        loaded.get_param("b", result)
+        np.testing.assert_allclose(result.numpy(), np.arange(n, dtype=np.float32) * 2.0)
+        assert_no_guest_cache()
+
+
+def test_cuda_source_enabled_capture_load_from_bytes(test, device):
+    """Load source-enabled captures from packaged bytes and validate their digests."""
+    a = wp.ones(8, dtype=float, device=device)
+    b = wp.zeros(8, dtype=float, device=device)
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(scale_kernel, dim=8, inputs=[a, b, 2.0], device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "source_enabled")
+        wp.capture_save(capture.graph, path, outputs={"b": b}, source_fallback=True)
+        with open(path + ".wrp", "rb") as wrp_file:
+            wrp_data = wrp_file.read()
+        modules = {}
+        for info in capture.graph._apic_capture.collected_modules.values():
+            filename = info["binary_filename"]
+            with open(os.path.join(path + "_modules", filename), "rb") as binary_file:
+                modules[filename] = binary_file.read()
+
+    loaded = wp.capture_load_from_bytes(wrp_data, modules, device=device)
+    wp.capture_launch(loaded)
+    result = wp.zeros(8, dtype=float, device=device)
+    loaded.get_param("b", result)
+    np.testing.assert_allclose(result.numpy(), np.full(8, 2.0, dtype=np.float32))
+
+    filename = next(iter(modules))
+    modules[filename] = b"intentionally invalid CUDA module"
+    with test.assertRaisesRegex(RuntimeError, "SHA-256 check"):
+        wp.capture_load_from_bytes(wrp_data, modules, device=device)
+
+
+def test_cuda_source_fallback_reports_missing_source(test, device):
+    """Report both packaged-binary rejection and a missing source dependency."""
+    a = wp.ones(8, dtype=float, device=device)
+    b = wp.zeros(8, dtype=float, device=device)
+
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(scale_kernel, dim=8, inputs=[a, b, 2.0], device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "missing_source")
+        wp.capture_save(capture.graph, path, outputs={"b": b}, source_fallback=True)
+        module_info = next(iter(capture.graph._apic_capture.collected_modules.values()))
+        artifact = module_info["cuda_compile_artifact"]
+        test.assertIsNotNone(artifact)
+        modules_dir = path + "_modules"
+        with open(os.path.join(modules_dir, module_info["binary_filename"]), "wb") as binary_file:
+            binary_file.write(b"intentionally invalid CUDA module")
+        os.remove(os.path.join(modules_dir, artifact["source_filename"]))
+
+        with test.assertRaisesRegex(
+            RuntimeError,
+            r"packaged binary.*SHA-256 check.*generated source.*was not found",
+        ):
+            wp.capture_load(path, device=device)
+
+
+def test_cuda_source_fallback_rejects_mathdx_link_inputs(test, device):
+    """Reject source fallback for a real MathDx-linked module while binary-only saving still works."""
+    if not wp_context.runtime.core.wp_is_mathdx_enabled():
+        test.skipTest("Warp was built without MathDx")
+    if not wp.config.enable_mathdx_gemm:
+        test.skipTest("MathDx GEMM is disabled")
+
+    a = wp.array(np.eye(16, dtype=np.float32), device=device)
+    b = wp.array(np.arange(256, dtype=np.float32).reshape(16, 16), device=device)
+    c = wp.zeros((16, 16), dtype=float, device=device)
+
+    # Build and load the module outside the capture.
+    wp.launch_tiled(apic_mathdx_matmul_kernel, dim=[1], inputs=[a, b, c], block_dim=64, device=device)
+    np.testing.assert_allclose(c.numpy(), b.numpy())
+    c.zero_()
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch_tiled(apic_mathdx_matmul_kernel, dim=[1], inputs=[a, b, c], block_dim=64, device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "mathdx")
+        with test.assertRaises(RuntimeError) as raised:
+            wp.capture_save(capture.graph, path, outputs={"c": c}, source_fallback=True)
+        test.assertIn(
+            "external link inputs are required (generated source declares LTO-IR or fatbin inputs)",
+            str(raised.exception),
+        )
+        test.assertFalse(os.path.exists(path + ".wrp"))
+        test.assertFalse(os.path.exists(path + "_modules"))
+
+        wp.capture_save(capture.graph, path, outputs={"c": c})
+        loaded = wp.capture_load(path, device=device)
+        wp.capture_launch(loaded)
+        result = wp.zeros_like(c)
+        loaded.get_param("c", result)
+        np.testing.assert_allclose(result.numpy(), b.numpy())
+
+
+def test_capture_save_binary_only_cuda_module(test, device):
+    """Save CUDA binaries silently by default and when fallback is disabled."""
+    a = wp.ones(8, dtype=float, device=device)
+    b = wp.zeros(8, dtype=float, device=device)
+
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(scale_kernel, dim=8, inputs=[a, b, 2.0], device=device)
+
+    module_info = next(iter(capture.graph._apic_capture.collected_modules.values()))
+    artifact = module_info["cuda_compile_artifact"]
+    test.assertIsNotNone(artifact)
+    for explicit in (False, True):
+        with (
+            test.subTest(explicit=explicit),
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch.dict(artifact, {"fallback_reason": "external_includes"}),
+            mock.patch.object(wp_context, "log_warning") as warning,
+        ):
+            path = os.path.join(tmpdir, "binary_only")
+            kwargs = {"source_fallback": False} if explicit else {}
+            wp.capture_save(capture.graph, path, outputs={"b": b}, **kwargs)
+            warning.assert_not_called()
+            test.assertTrue(os.path.isfile(path + ".wrp"))
+            test.assertFalse(any(name.endswith(".cu") for name in os.listdir(path + "_modules")))
+            loaded = wp.capture_load(path, device=device)
+            wp.capture_launch(loaded)
+            result = wp.zeros(8, dtype=float, device=device)
+            loaded.get_param("b", result)
+            np.testing.assert_allclose(result.numpy(), np.full(8, 2.0, dtype=np.float32))
+
+
+def test_capture_save_binary_only_after_source_fallback(test, device):
+    """Remove stale source exports and metadata when fallback is disabled."""
+    a = wp.ones(8, dtype=float, device=device)
+    b = wp.zeros(8, dtype=float, device=device)
+
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(scale_kernel, dim=8, inputs=[a, b, 2.0], device=device)
+
+    for explicit in (False, True):
+        with test.subTest(explicit=explicit), tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "binary_after_portable")
+            wp.capture_save(capture.graph, path, outputs={"b": b}, source_fallback=True)
+            modules_dir = path + "_modules"
+            test.assertTrue(any(name.endswith(".cu") for name in os.listdir(modules_dir)))
+            kwargs = {"source_fallback": False} if explicit else {}
+            wp.capture_save(capture.graph, path, outputs={"b": b}, **kwargs)
+            test.assertFalse(any(name.endswith(".cu") for name in os.listdir(modules_dir)))
+            loaded = wp.capture_load(path, device=device)
+            wp.capture_launch(loaded)
+            result = wp.zeros(8, dtype=float, device=device)
+            loaded.get_param("b", result)
+            np.testing.assert_allclose(result.numpy(), np.full(8, 2.0, dtype=np.float32))
+            del loaded
+            gc.collect()
+
+            module_info = next(iter(capture.graph._apic_capture.collected_modules.values()))
+            with open(os.path.join(modules_dir, module_info["binary_filename"]), "wb") as binary_file:
+                binary_file.write(b"intentionally invalid CUDA module")
+
+            _assert_apic_load_rejected(test, path, device, r"Failed to load APIC graph")
+            error = wp_context.runtime.get_error_string()
+            test.assertNotIn("generated source", error)
+            test.assertNotIn("SHA-256", error)
+            test.assertFalse(any(name.startswith("apic_guest_") for name in os.listdir(modules_dir)))
+
+
+def test_capture_save_failed_overwrite_remains_replayable(test, device):
+    """Replay an existing CPU or CUDA artifact after serialization or publication fails."""
+    a = wp.ones(8, dtype=float, device=device)
+    b = wp.zeros(8, dtype=float, device=device)
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(scale_kernel, dim=8, inputs=[a, b, 2.0], device=device)
+
+    for failure in ("native", "publication"):
+        with test.subTest(failure=failure), tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "existing")
+            wp.capture_save(capture.graph, path, outputs={"b": b}, source_fallback=device.is_cuda)
+            original = _snapshot_apic_export(path)
+            original_entries = set(os.listdir(tmpdir))
+            native_save = wp_context.runtime.core.wp_apic_state_save
+            replace = os.replace
+
+            def save_graph(state, filename, target_arch, context, failure=failure, native_save=native_save):
+                if failure == "native":
+                    with open(filename, "wb") as wrp_file:
+                        wrp_file.write(b"partial capture")
+                    return False
+                return native_save(state, filename, target_arch, context)
+
+            def publish(src, dst, failure=failure, path=path, replace=replace):
+                if failure == "publication" and dst == path + ".wrp":
+                    raise OSError("injected publication failure")
+                return replace(src, dst)
+
+            with (
+                mock.patch.object(wp_context.runtime.core, "wp_apic_state_save", side_effect=save_graph),
+                mock.patch.object(wp_context.os, "replace", side_effect=publish),
+            ):
+                with test.assertRaises((RuntimeError, OSError)):
+                    wp.capture_save(capture.graph, path, outputs={"b": b}, source_fallback=False)
+            test.assertEqual(_snapshot_apic_export(path), original)
+            test.assertEqual(set(os.listdir(tmpdir)), original_entries)
+
+            loaded = wp.capture_load(path, device=device)
+            wp.capture_launch(loaded)
+            result = wp.zeros(8, dtype=float, device=device)
+            loaded.get_param("b", result)
+            np.testing.assert_allclose(result.numpy(), np.full(8, 2.0, dtype=np.float32))
+            del loaded
+            gc.collect()
+
+
 def test_save_load_capture_time_scratch_cuda(test, device):
-    """A buffer allocated via the bare wp.array(shape=...) constructor *during* a
+    """Treat capture-time CUDA allocations as graph-scoped scratch buffers.
+
+    A buffer allocated via the bare wp.array(shape=...) constructor *during* a
     CUDA APIC capture is graph-scoped. track_array marks it transient (keyed on this
     capture's apic_state) so capture_save serializes its size only and the rebuild
     regenerates it from the recorded kernels. A persistent array allocated *before* the
@@ -468,7 +1926,9 @@ def test_save_load_capture_time_scratch_cuda(test, device):
 
 
 def test_apic_h2d_rejected_during_capture(test, device):
-    """Host-to-device transfers are not recorded into the APIC byte stream, so
+    """Reject host-to-device transfers during CUDA APIC capture.
+
+    Host-to-device transfers are not recorded into the APIC byte stream, so
     initializing a CUDA array from host data during an APIC capture cannot be reproduced on
     replay. wp.copy() from a host array and wp.array(data=..., device=cuda) must be rejected
     rather than silently producing an uninitialized region on load."""
@@ -487,7 +1947,9 @@ def test_apic_h2d_rejected_during_capture(test, device):
 
 
 def test_apic_cuda_copy_gaps_rejected_during_capture(test, device):
-    """Copy variants with no APIC byte-stream representation must fail loudly under a CUDA
+    """Reject unrepresentable copy variants during CUDA APIC capture.
+
+    Copy variants with no APIC byte-stream representation must fail loudly under a CUDA
     APIC capture rather than silently dropping from the saved graph: a non-contiguous
     (indexed/strided) CUDA copy, and a device-to-host copy. Contiguous same-device D2D is
     recorded and unaffected."""
@@ -510,7 +1972,9 @@ def test_apic_cuda_copy_gaps_rejected_during_capture(test, device):
 
 
 def test_apic_cuda_indexed_fill_rejected_during_capture(test, device):
-    """Indexed CUDA fill has no APIC byte-stream representation yet, so it must fail
+    """Reject indexed fills during CUDA APIC capture.
+
+    Indexed CUDA fill has no APIC byte-stream representation yet, so it must fail
     loudly instead of silently dropping from the saved graph."""
     base = wp.zeros(8, dtype=wp.float32, device=device)
     idx = wp.array([0, 2, 4, 6], dtype=wp.int32, device=device)
@@ -524,7 +1988,9 @@ def test_apic_cuda_indexed_fill_rejected_during_capture(test, device):
 
 
 def test_apic_capture_while_body_raises_cleanup(test, device):
-    """A raising capture_while body must propagate cleanly and leave the device's
+    """Restore capture state when a ``capture_while`` body raises.
+
+    A raising capture_while body must propagate cleanly and leave the device's
     capture state consistent (parent graph restored, parent capture resumed, APIC recording
     torn down, no leaked branch) so a subsequent capture works. The broken capture is never
     launched -- its while node has an empty body and would loop forever."""
@@ -558,7 +2024,9 @@ def test_apic_capture_while_body_raises_cleanup(test, device):
 
 
 def test_apic_capture_if_body_raises_cleanup(test, device):
-    """Companion to the capture_while case -- a raising capture_if branch body
+    """Restore capture state when a ``capture_if`` body raises.
+
+    Companion to the capture_while case -- a raising capture_if branch body
     propagates cleanly (branch rolled back, parent graph restored and capture resumed) and
     leaves the device reusable for a subsequent capture."""
     if device.is_cuda and not wp.is_conditional_graph_supported():
@@ -589,7 +2057,7 @@ def test_apic_capture_if_body_raises_cleanup(test, device):
 
 
 def test_bindings_param_update(test, device):
-    """set_param changes input, verify output changes."""
+    """Verify that parameter updates change graph output."""
     n = 128
     a = wp.array(np.ones(n, dtype=np.float32), device=device)
     b = wp.zeros(n, dtype=float, device=device)
@@ -711,7 +2179,7 @@ def test_save_load_memset(test, device):
 
 
 def test_array_slicing(test, device):
-    """Array slices sharing a base allocation map to the same region."""
+    """Verify that array slices sharing a base allocation map to the same region."""
     n = 1024
     base_arr = wp.array(np.arange(n, dtype=np.float32), device=device)
     slice1 = base_arr[0:512]
@@ -726,6 +2194,7 @@ def test_array_slicing(test, device):
     # All should map to the same region
     test.assertEqual(region_id_base, region_id_1)
     test.assertEqual(region_id_base, region_id_2)
+    test.assertEqual(set(apic._regions), {("warp", id(base_arr))})
 
     # Offsets
     test.assertEqual(offset_base, 0)
@@ -736,7 +2205,7 @@ def test_array_slicing(test, device):
 
 
 def test_complex_pipeline(test, device):
-    """Multi-stage pipeline: kernels + memcpy round-trip."""
+    """Round-trip a multistage kernel and memory-copy pipeline."""
     n = 128
     a = wp.array(np.ones(n, dtype=np.float32) * 2.0, device=device)
     b = wp.array(np.ones(n, dtype=np.float32) * 3.0, device=device)
@@ -779,7 +2248,7 @@ def test_complex_pipeline(test, device):
 
 
 def test_internal_allocation(test, device):
-    """Array allocated inside capture scope, used by subsequent ops."""
+    """Test array allocated inside capture scope, used by subsequent ops."""
     n = 128
     input_data = wp.array(np.arange(n, dtype=np.float32) + 1.0, device=device)
     output_data = wp.zeros(n, dtype=float, device=device)
@@ -814,7 +2283,7 @@ def test_internal_allocation(test, device):
 
 
 def test_multiple_internal_allocations(test, device):
-    """Multiple temporary arrays allocated inside capture scope."""
+    """Test multiple temporary arrays allocated inside capture scope."""
     n = 64
     input_data = wp.array(np.full(n, 2.0, dtype=np.float32), device=device)
     output_data = wp.zeros(n, dtype=float, device=device)
@@ -852,7 +2321,7 @@ def test_multiple_internal_allocations(test, device):
 
 
 def test_apic_alloc_grow_during_capture(test, device):
-    """A NEW array allocated inside capture stays valid across multiple replays.
+    """Verify that a NEW array allocated inside capture stays valid across multiple replays.
 
     Mirrors the Newton SolverVBD pattern of growing a buffer during capture: the temporary is
     allocated while recording, and the captured graph must re-resolve its region against the
@@ -883,7 +2352,7 @@ def test_apic_alloc_grow_during_capture(test, device):
 
 
 def test_cpu_graph_alloc_not_leaked_on_relaunch(test, device):
-    """In-graph allocations on CPU must not accumulate across relaunches.
+    """Verify that in-graph allocations on CPU must not accumulate across relaunches.
 
     CPU APIC allocates a graph's in-capture buffers once (at capture time) and reuses them
     on every replay -- APIC_OP_ALLOC is a no-op during replay and the backing array is
@@ -942,7 +2411,7 @@ def test_cpu_graph_alloc_not_leaked_on_relaunch(test, device):
 
 
 def test_graph_execution_unchanged(test, device):
-    """Normal graph execution still works with apic=True."""
+    """Verify that normal graph execution still works with apic=True."""
     n = 1024
     input_data = wp.array(np.arange(n, dtype=np.float32), device=device)
     output_data = wp.zeros(n, dtype=float, device=device)
@@ -960,7 +2429,7 @@ def test_graph_execution_unchanged(test, device):
 
 
 def test_save_load_with_param_update(test, device):
-    """Full round-trip with set_param on multiple kernels."""
+    """Round-trip parameter updates across multiple kernels."""
     n = 128
     a = wp.array(np.full(n, 2.0, dtype=np.float32), device=device)
     b = wp.array(np.full(n, 3.0, dtype=np.float32), device=device)
@@ -1032,7 +2501,7 @@ def test_save_load_memcpy_and_kernel(test, device):
 
 
 def test_cpu_graph_replay_after_array_refs_released(test, device):
-    """CPU APIC replay must retain owned arrays used during capture."""
+    """Verify that CPU APIC replay must retain owned arrays used during capture."""
     n = 32
     sentinel = -100.0
     src_values = np.arange(n, dtype=np.float32) + 1.0
@@ -1104,7 +2573,7 @@ def test_save_load_fill(test, device):
 
 
 def test_save_load_alloc_only(test, device):
-    """Allocation + memcpy inside capture, no kernel launches — tests apic_record_alloc round-trip."""
+    """Round-trip a captured allocation and memory copy without kernel launches."""
     n = 64
     src = wp.array(np.arange(n, dtype=np.float32) + 1.0, device=device)
 
@@ -1176,7 +2645,9 @@ def two_d_strided_kernel(
 
 
 def test_capture_2d_launch_minimal(test, device):
-    """Minimal repro of basic_conveyor's narrow_phase_find_mesh_triangle_overlaps_kernel
+    """Capture a two-dimensional launch with many parameters.
+
+    Minimal repro of basic_conveyor's narrow_phase_find_mesh_triangle_overlaps_kernel
     crash: 2D launch with 13 params (10 arrays + 1 scalar + 2 arrays), one of
     them potentially empty."""
     n = 23
@@ -1220,7 +2691,9 @@ def _tile_using_kernel(out: wp.array[float]):
 
 
 def test_capture_replay_with_tile_kernel_no_stack_overflow(test, device):
-    """Regression: a kernel that uses tile primitives allocates ~256 KB on
+    """Replay a tile kernel without overflowing the host stack.
+
+    Regression: a kernel that uses tile primitives allocates ~256 KB on
     the stack via tile_shared_storage_t. The APIC replay path used to keep
     sibling stack arrays (fwd_stack[512], adj_stack[512]) alongside the
     deep replay-call stack frame, which combined with the 256 KB the kernel
@@ -1244,7 +2717,7 @@ def test_capture_replay_with_tile_kernel_no_stack_overflow(test, device):
 
 
 def test_save_load_tiled_nondefault_block_dim(test, device):
-    """APIC save must copy the binary for the captured block_dim variant."""
+    """Verify that APIC save must copy the binary for the captured block_dim variant."""
     n = 32
     block_dim = 64
     out = wp.zeros(n, dtype=float, device=device)
@@ -1291,7 +2764,9 @@ def _vec3_after_int_kernel(
 
 
 def test_capture_replay_vec3_scalar_alignment(test, device):
-    """Regression: a vec3 param (size=12) appearing in the middle of a kernel
+    """Preserve scalar-parameter alignment after a ``vec3`` parameter.
+
+    Regression: a vec3 param (size=12) appearing in the middle of a kernel
     signature has alignof=4 in C++, but the replay packer used a size-based
     heuristic (>= 8 → align 8) that introduced 4 bytes of phantom padding.
     Every subsequent param shifted, so array data pointers were read from
@@ -1318,7 +2793,9 @@ def test_capture_replay_vec3_scalar_alignment(test, device):
 
 
 def test_capture_with_empty_array_input(test, device):
-    """An empty array (shape=(0,), arr.ptr is None) used as a kernel input
+    """Capture a kernel with an empty array input.
+
+    An empty array (shape=(0,), arr.ptr is None) used as a kernel input
     must not crash APIC capture in _find_base / track_array. This is the
     pattern Newton's narrow_phase hits with unused contact buffers."""
     n_out = 64
@@ -1400,7 +2877,9 @@ def big_struct_sum_kernel(s: BigStruct96, out: wp.array[float]):
 
 
 def test_capture_with_large_scalar_param(test, device):
-    """A by-value struct param > 64 B (e.g. Newton's contact-writer struct)
+    """Capture and replay a large by-value struct parameter.
+
+    A by-value struct param > 64 B (e.g. Newton's contact-writer struct)
     must capture and replay correctly via the per-launch scalar pool, both
     for in-memory replay and after a .wrp round-trip."""
     n = 8
@@ -1446,7 +2925,9 @@ def assign_kernel(x: wp.array[float], y: wp.array[float]):
 
 
 def test_capture_backward_consumes_y_grad(test, device):
-    """The adjoint replay path must consume an output array's seeded grad the
+    """Consume seeded output gradients during adjoint replay.
+
+    The adjoint replay path must consume an output array's seeded grad the
     same way live ``Tape.backward()`` does. Regression for the case where
     ``apic_pack_args_buf`` hardcoded ``arr->grad = 0`` and silently dropped
     the array's grad pointer and flags."""
@@ -1474,7 +2955,9 @@ def test_capture_backward_consumes_y_grad(test, device):
 
 
 def test_capture_backward_retain_grad(test, device):
-    """``retain_grad=True`` must survive APIC capture: the array's
+    """Preserve ``retain_grad`` through APIC capture and replay.
+
+    ``retain_grad=True`` must survive APIC capture: the array's
     ARRAY_FLAG_RETAIN_GRAD bit needs to round-trip via array_flags so that
     adj_array_store's consume path is skipped at replay."""
     n = 4
@@ -1500,7 +2983,9 @@ def test_capture_backward_retain_grad(test, device):
 
 
 def test_capture_backward_kernel(test, device):
-    """Backward kernel launches must record cleanly during APIC capture and
+    """Record and replay backward kernel launches during APIC capture.
+
+    Backward kernel launches must record cleanly during APIC capture and
     replay correctly. Drives the diffsim path Newton needs."""
     n = 8
     x = wp.array(np.arange(n, dtype=np.float32), device=device, requires_grad=True)
@@ -1526,9 +3011,12 @@ def test_capture_backward_kernel(test, device):
 
 @wp.struct
 class StructWithArrays:
-    """By-value struct holding two wp.array fields. The launch-param walker
-    must emit DATA_PTR / NULL relocations for each nested array_t.data and
-    array_t.grad slot, at the correct offsets within the struct blob."""
+    """Hold two Warp array fields by value.
+
+    The launch-parameter walker must emit ``DATA_PTR`` or ``NULL`` relocations
+    for each nested ``array_t.data`` and ``array_t.grad`` slot at the correct
+    offsets within the struct blob.
+    """
 
     pos: wp.array[wp.vec3]
     vel: wp.array[wp.vec3]
@@ -1542,7 +3030,9 @@ def step_particles_struct_kernel(p: StructWithArrays, dt: float):
 
 
 def test_capture_struct_with_array(test, device):
-    """A @wp.struct containing wp.array fields must capture + replay correctly:
+    """Capture and replay struct parameters containing arrays.
+
+    A @wp.struct containing wp.array fields must capture + replay correctly:
     each nested array_t.data field is patched via a per-blob relocation, so
     replay writes into the same memory the live launch would have written.
     """
@@ -1583,7 +3073,9 @@ def write_indexed_kernel(arr: wp.indexedarray[float], v: float):
 
 
 def test_capture_indexedarray(test, device):
-    """wp.indexedarray as a launch parameter must capture + replay correctly:
+    """Capture and replay indexed-array launch parameters.
+
+    wp.indexedarray as a launch parameter must capture + replay correctly:
     the value blob is the indexedarray_t descriptor; the walker emits relocs
     for the nested array_t.data, array_t.grad, and each indices[d] pointer.
     """
@@ -1629,7 +3121,9 @@ def weighted_sample_sum_kernel(
 
 
 def test_capture_indexedarray_adjoint_pack(test, device):
-    """Custom-adjoint launch with an ``wp.indexedarray`` argument must capture
+    """Pack indexed-array adjoints during APIC capture.
+
+    Custom-adjoint launch with an ``wp.indexedarray`` argument must capture
     without raising. The forward arg type is ``indexedarray``, but Warp's
     backward ABI represents the corresponding adjoint as a plain ``wp.array``
     (the underlying gradient buffer). APIC must walk the adjoint value blob
@@ -1679,7 +3173,7 @@ def decrement_counter_kernel(c: wp.array[wp.int32]):
 
 
 def test_capture_if_cpu(test, device):
-    """APIC_OP_IF on CPU: condition selects which branch runs at replay."""
+    """Select the replayed CPU branch with ``APIC_OP_IF``."""
     if device.is_cuda and not wp.is_conditional_graph_supported():
         test.skipTest("CUDA conditional graph nodes require Toolkit and driver 12.4+")
 
@@ -1712,7 +3206,9 @@ def test_capture_if_cpu(test, device):
 
 
 def test_save_load_capture_if_cuda(test, device):
-    """CUDA loaded-graph replay DOES support APIC conditional ops --
+    """Rebuild CUDA APIC conditional operations during graph loading.
+
+    CUDA loaded-graph replay DOES support APIC conditional ops --
     apic_replay_ops_into_cuda_capture rebuilds the conditional nodes from the
     byte stream. Save/load a capture_if graph and confirm the recorded branch
     runs on the rebuilt graph."""
@@ -1747,7 +3243,7 @@ def test_save_load_capture_if_cuda(test, device):
 
 
 def test_capture_while_cpu(test, device):
-    """APIC_OP_WHILE on CPU: body re-runs while the condition int32 is nonzero."""
+    """Repeat the CPU replay body with ``APIC_OP_WHILE`` while its condition is nonzero."""
     if device.is_cuda and not wp.is_conditional_graph_supported():
         test.skipTest("CUDA conditional graph nodes require Toolkit and driver 12.4+")
 
@@ -1775,9 +3271,12 @@ def test_capture_while_cpu(test, device):
 
 
 def _make_const_writer(value):
-    """Build a kernel that writes a compile-time constant. Two kernels from this
-    factory share ``kernel.key`` (``_make_const_writer__locals__kernel``) but
-    compile to distinct modules via ``module="unique"``."""
+    """Build a kernel that writes a compile-time constant.
+
+    Two kernels from this factory share ``kernel.key``
+    (``_make_const_writer__locals__kernel``) but compile to distinct modules
+    via ``module="unique"``.
+    """
     constant = value
 
     @wp.kernel(module="unique")
@@ -1788,7 +3287,9 @@ def _make_const_writer(value):
 
 
 def test_capture_distinct_modules_same_key(test, device):
-    """Regression: kernels built with ``module="unique"`` from one factory share
+    """Replay distinct unique-module kernels that share a key.
+
+    Regression: kernels built with ``module="unique"`` from one factory share
     a ``kernel.key`` but compile to distinct functions. APIC keyed CPU replay
     kernels by key alone, so the second registration clobbered the first and
     replay dispatched the wrong compiled kernel (wrong results or out-of-bounds
@@ -1815,7 +3316,7 @@ def test_capture_distinct_modules_same_key(test, device):
 
 
 def test_save_load_distinct_modules_same_key(test, device):
-    """Saved CPU APIC graphs must also dispatch same-key unique-module kernels."""
+    """Verify that saved CPU APIC graphs must also dispatch same-key unique-module kernels."""
     ka = _make_const_writer(111)
     kb = _make_const_writer(222)
     test.assertEqual(ka.key, kb.key)
@@ -1870,6 +3371,28 @@ def test_capture_with_array_reductions(test, device):
     np.testing.assert_allclose(inner_out.numpy(), np.array([expected_a @ expected_b], dtype=np.float32))
 
 
+def test_capture_with_negative_axis_array_reductions(test, device):
+    """Verify captured array reductions replay correctly with negative axes."""
+    values_np = np.arange(1.0, 7.0, dtype=np.float32).reshape(2, 3)
+    other_np = np.arange(7.0, 13.0, dtype=np.float32).reshape(2, 3)
+    values = wp.array(values_np, device=device)
+    other = wp.array(other_np, device=device)
+    sum_out = wp.full((2, 1), -1.0, dtype=wp.float32, device=device)
+    inner_out = wp.full((2, 1), -1.0, dtype=wp.float32, device=device)
+
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.utils.array_sum(values, out=sum_out, axis=-1)
+        wp.utils.array_inner(values, other, out=inner_out, axis=-1)
+
+    np.testing.assert_allclose(sum_out.numpy(), np.full((2, 1), -1.0, dtype=np.float32))
+    np.testing.assert_allclose(inner_out.numpy(), np.full((2, 1), -1.0, dtype=np.float32))
+
+    wp.capture_launch(capture.graph)
+
+    np.testing.assert_allclose(sum_out.numpy(), values_np.sum(axis=-1, keepdims=True))
+    np.testing.assert_allclose(inner_out.numpy(), (values_np * other_np).sum(axis=-1, keepdims=True))
+
+
 def test_array_reduction_capture_errors(test, device):
     """Reject unsupported array reductions during capture."""
     values = wp.array([1.0, 2.0, 3.0], dtype=wp.float32, device=device)
@@ -1901,6 +3424,120 @@ def test_array_reduction_capture_errors(test, device):
             wp.utils.array_inner(values, values, out=out, count=-1)
 
 
+def test_array_reduction_count_bounds_during_capture(test, device):
+    """Reject excessive counts without invalidating subsequent captured reductions."""
+    base = wp.array(np.arange(1.0, 25.0, dtype=np.float32), device=device)
+    values = base[:6].reshape((2, 3))
+    sum_out = wp.full(1, -1.0, dtype=wp.float32, device=device)
+    inner_out = wp.full(1, -1.0, dtype=wp.float32, device=device)
+    rejected_outputs = {
+        axis: wp.full(shape, -1.0, dtype=wp.float32, device=device)
+        for axis, shape in ((None, (1,)), (0, (1, 3)), (1, (2, 1)))
+    }
+
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        for axis in (None, 0, 1, -1, -2):
+            limit = values.size if axis is None else values.shape[axis]
+            out = rejected_outputs[None if axis is None else axis % values.ndim]
+            with test.subTest(axis=axis, operation="array_sum"):
+                with test.assertRaisesRegex(RuntimeError, r"array_sum\(\).*value_count.*exceed"):
+                    wp.utils.array_sum(values, out=out, value_count=limit + 1, axis=axis)
+            with test.subTest(axis=axis, operation="array_inner"):
+                with test.assertRaisesRegex(RuntimeError, r"array_inner\(\).*count.*exceed"):
+                    wp.utils.array_inner(values, values, out=out, count=limit + 1, axis=axis)
+
+        wp.utils.array_sum(values, out=sum_out)
+        wp.utils.array_inner(values, values, out=inner_out)
+
+    for out in rejected_outputs.values():
+        np.testing.assert_array_equal(out.numpy(), np.full(out.shape, -1.0, dtype=np.float32))
+
+    wp.capture_launch(capture.graph)
+    for out in rejected_outputs.values():
+        np.testing.assert_array_equal(out.numpy(), np.full(out.shape, -1.0, dtype=np.float32))
+    test.assertEqual(sum_out.numpy()[0], 21.0)
+    test.assertEqual(inner_out.numpy()[0], 91.0)
+
+
+def test_strided_whole_array_reductions_during_capture(test, device):
+    """Reject unsupported copies without invalidating the active capture."""
+    base = wp.array((1.0, 100.0, 2.0, 200.0, 3.0, 300.0), dtype=wp.float32, device=device)
+    values = base[::2]
+    other = wp.array((4.0, 5.0, 6.0), dtype=wp.float32, device=device)
+    sum_out = wp.empty(1, dtype=wp.float32, device=device)
+    inner_out = wp.empty(1, dtype=wp.float32, device=device)
+    axis_sum_out = wp.empty(1, dtype=wp.float32, device=device)
+    axis_inner_out = wp.empty(1, dtype=wp.float32, device=device)
+    zero_out = wp.full(1, -1.0, dtype=wp.float32, device=device)
+
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        with test.assertRaisesRegex(NotImplementedError, r"array_sum\(\).*non-contiguous"):
+            wp.utils.array_sum(values, out=sum_out)
+        for a, b in ((values, other), (other, values)):
+            with test.assertRaisesRegex(NotImplementedError, r"array_inner\(\).*non-contiguous"):
+                wp.utils.array_inner(a, b, out=inner_out)
+
+        wp.utils.array_sum(other, out=sum_out)
+        wp.utils.array_inner(other, other, out=inner_out)
+        wp.utils.array_sum(values, out=axis_sum_out, axis=0)
+        wp.utils.array_inner(values, other, out=axis_inner_out, axis=0)
+        wp.utils.array_sum(values, out=zero_out, value_count=0)
+        wp.utils.array_inner(values, other, out=zero_out, count=0)
+
+    wp.capture_launch(capture.graph)
+    test.assertEqual(sum_out.numpy()[0], 15.0)
+    test.assertEqual(inner_out.numpy()[0], 77.0)
+    test.assertEqual(axis_sum_out.numpy()[0], 6.0)
+    test.assertEqual(axis_inner_out.numpy()[0], 32.0)
+    test.assertEqual(zero_out.numpy()[0], 0.0)
+
+    base.assign((7.0, 100.0, 8.0, 200.0, 9.0, 300.0))
+    other.assign((1.0, 2.0, 3.0))
+    wp.capture_launch(capture.graph)
+    test.assertEqual(sum_out.numpy()[0], 6.0)
+    test.assertEqual(inner_out.numpy()[0], 14.0)
+    test.assertEqual(axis_sum_out.numpy()[0], 24.0)
+    test.assertEqual(axis_inner_out.numpy()[0], 50.0)
+
+
+def test_compact_whole_array_reductions_during_capture(test, device):
+    """Replay compact transposed reductions while rejecting layouts that need copies."""
+    values_base = wp.array(((1.0, 2.0, 3.0), (4.0, 5.0, 6.0)), dtype=wp.float32, device=device)
+    other_base = wp.array(((7.0, 8.0, 9.0), (10.0, 11.0, 12.0)), dtype=wp.float32, device=device)
+    values = values_base.transpose()
+    other = other_base.transpose()
+    other_contiguous = wp.array(other.numpy(), dtype=wp.float32, device=device)
+    outputs = [wp.full(1, -1.0, dtype=wp.float32, device=device) for _ in range(4)]
+
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        with test.assertRaises(NotImplementedError):
+            wp.utils.array_sum(values, out=outputs[0], value_count=2)
+        with test.assertRaises(NotImplementedError):
+            wp.utils.array_inner(values, other, out=outputs[1], count=2)
+        for a, b in ((values, other_contiguous), (other_contiguous, values)):
+            with test.assertRaises(NotImplementedError):
+                wp.utils.array_inner(a, b, out=outputs[1])
+
+        for index, count in enumerate((None, values.size)):
+            wp.utils.array_sum(values, out=outputs[2 * index], value_count=count)
+            wp.utils.array_inner(values, other, out=outputs[2 * index + 1], count=count)
+
+    for out in outputs:
+        test.assertEqual(out.numpy()[0], -1.0)
+
+    wp.capture_launch(capture.graph)
+    for index in (0, 2):
+        test.assertEqual(outputs[index].numpy()[0], 21.0)
+        test.assertEqual(outputs[index + 1].numpy()[0], 217.0)
+
+    values_base.assign(((11.0, 12.0, 13.0), (14.0, 15.0, 16.0)))
+    other_base.assign(((2.0, 4.0, 6.0), (8.0, 10.0, 12.0)))
+    wp.capture_launch(capture.graph)
+    for index in (0, 2):
+        test.assertEqual(outputs[index].numpy()[0], 81.0)
+        test.assertEqual(outputs[index + 1].numpy()[0], 602.0)
+
+
 def test_empty_array_reductions_during_capture(test, device):
     """Preserve empty array-reduction behavior during capture."""
     empty_vector = wp.empty(0, dtype=wp.vec2, device=device)
@@ -1929,7 +3566,9 @@ def test_empty_array_reductions_during_capture(test, device):
 
 
 def test_cpu_helper_not_recorded_during_cuda_capture(test, device):
-    """A CPU host helper invoked during a CUDA APIC capture must execute live,
+    """Execute CPU helpers live during CUDA APIC capture.
+
+    A CPU host helper invoked during a CUDA APIC capture must execute live,
     not record into the CUDA byte stream. The native host hooks are gated on the
     capture's device class, so a CPU array_scan run inside a CUDA capture runs
     immediately (its output is correct once the capture block exits) instead of
@@ -1969,7 +3608,9 @@ def test_array_reduction_cpu_not_recorded_during_cuda_capture(test, device):
 
 
 def test_capture_pause_resume_allows_unrecorded_allocation(test, device):
-    """capture_pause()/capture_resume() must let callers build data outside the
+    """Allow unrecorded allocation while APIC capture is paused.
+
+    capture_pause()/capture_resume() must let callers build data outside the
     recorded APIC stream while surrounding launches still replay."""
     if device.is_cuda and not wp_context.is_conditional_graph_supported():
         test.skipTest("CUDA graph pause/resume requires CUDA Toolkit and driver 12.4+")
@@ -1998,7 +3639,9 @@ def test_capture_pause_resume_allows_unrecorded_allocation(test, device):
 
 
 def test_capture_pause_resume_suspends_apic_recording(test, device):
-    """Work performed while APIC capture is paused must not be recorded into the
+    """Suspend APIC recording through public capture pause and resume calls.
+
+    Work performed while APIC capture is paused must not be recorded into the
     APIC byte stream. Conditional graph construction uses an internal
     non-suspending pause path; this test covers the public pause/resume API."""
     if device.is_cuda and not wp_context.is_conditional_graph_supported():
@@ -2041,7 +3684,9 @@ def test_capture_pause_resume_suspends_apic_recording(test, device):
 
 
 def test_bsr_nnz_sync_during_cpu_apic_capture(test, device):
-    """BsrMatrix.nnz_sync() during a CPU APIC capture must not crash and must
+    """Return the live BSR nonzero count during CPU APIC capture.
+
+    BsrMatrix.nnz_sync() during a CPU APIC capture must not crash and must
     return the real block count: the readback is performed with recording paused
     so it runs live rather than recording a deferred host copy into an
     uninitialized buffer."""
@@ -2058,7 +3703,7 @@ def test_bsr_nnz_sync_during_cpu_apic_capture(test, device):
 
 
 def test_bsr_nnz_sync_after_recorded_topology_rejected(test, device):
-    """A deferred topology update cannot provide a replay-time nnz during capture."""
+    """Verify that a deferred topology update cannot provide a replay-time nnz during capture."""
     from warp.sparse import bsr_set_from_triplets, bsr_zeros  # noqa: PLC0415
 
     rows = wp.array(np.array([1, 0, 1], dtype=np.int32), dtype=wp.int32, device=device)
@@ -2073,7 +3718,9 @@ def test_bsr_nnz_sync_after_recorded_topology_rejected(test, device):
 
 
 def test_bsr_status_sync_during_cpu_apic_capture_rejected(test, device):
-    """BsrMatrix.status_sync() must reject a host readback during a CPU APIC
+    """Reject BSR status readback during CPU APIC capture.
+
+    BsrMatrix.status_sync() must reject a host readback during a CPU APIC
     capture: a padded op recorded in the capture writes the status only on
     replay, so a status read inside the capture would observe a pre-replay
     value. Outside the capture the readback works normally."""
@@ -2193,7 +3840,9 @@ def test_save_load_array_reduction_metadata(test, device):
 
 
 def test_borrow_temporary_not_recycled_during_apic_capture(test, device):
-    """Regression: ``warp.fem`` temporaries borrowed during APIC capture must not
+    """Keep borrowed FEM temporaries alive during APIC capture.
+
+    Regression: ``warp.fem`` temporaries borrowed during APIC capture must not
     be recycled by the temporary pool. The captured byte stream references them by
     pointer, so a release + re-borrow that handed the same pool memory back for a
     distinct captured region left replay reading/writing stale memory.
@@ -2231,7 +3880,9 @@ def copy_scaled_kernel(src: wp.array[float], dst: wp.array[float], idx: int, s: 
 
 
 def test_capture_replay_many_regions(test, device):
-    """Regression for the O(1) region-resolution index in the CPU live-capture
+    """Resolve many distinct regions during CPU APIC replay.
+
+    Regression for the O(1) region-resolution index in the CPU live-capture
     replay path (apic_resolve_state_region_ptr): a graph that registers many
     distinct array regions must resolve every one correctly on replay. Each of
     the `n` launches reads a distinct `src` array (a distinct region) and writes
@@ -2260,7 +3911,9 @@ def test_capture_replay_many_regions(test, device):
 
 
 def test_capture_with_record_cmd_launch(test, device):
-    """Regression: a reusable launch from ``wp.launch(..., record_cmd=True)``
+    """Record reusable launch commands during APIC capture.
+
+    Regression: a reusable launch from ``wp.launch(..., record_cmd=True)``
     invoked during APIC capture must record an APIC_OP_KERNEL_LAUNCH (it
     previously called the kernel hook directly, bypassing the byte stream, so
     the launch was dropped on replay). The output is clobbered after capture, so
@@ -2304,7 +3957,7 @@ def test_capture_with_record_cmd_launch(test, device):
 
 
 def test_record_cmd_raw_array_ctype_rejected_during_apic_capture(test, device):
-    """Raw ctypes array descriptors do not provide APIC relocation ownership."""
+    """Verify that raw ctypes array descriptors do not provide APIC relocation ownership."""
     n = 4
     a = wp.array(np.arange(n, dtype=np.float32), device=device)
     b = wp.ones(n, dtype=wp.float32, device=device)
@@ -2329,7 +3982,9 @@ def fill_diag_triplets_kernel(rows: wp.array[wp.int32], columns: wp.array[wp.int
 
 
 def test_capture_with_bsr_from_triplets(test, device):
-    """Regression: wp.sparse.bsr_set_from_triplets on CPU computes the matrix
+    """Recompute BSR triplet topology during CPU APIC replay.
+
+    Regression: wp.sparse.bsr_set_from_triplets on CPU computes the matrix
     topology via a host function (wp_bsr_matrix_from_triplets_host) that, like the
     sorts/runlength_encode, was invisible to the APIC byte stream. The triplet
     arrays are produced by a kernel inside the capture (deferred at capture time),
@@ -2363,7 +4018,7 @@ def test_capture_with_bsr_from_triplets(test, device):
 
 
 def test_capture_with_bsr_from_triplets_topology_only(test, device):
-    """``bsr_set_from_triplets(values=None)`` still needs the recorded topology op."""
+    """Verify that ``bsr_set_from_triplets(values=None)`` still needs the recorded topology op."""
     from warp.sparse import bsr_set_from_triplets, bsr_zeros  # noqa: PLC0415
 
     rows = wp.array(np.array([1, 0, 1], dtype=np.int32), dtype=wp.int32, device=device)
@@ -2383,21 +4038,243 @@ def test_capture_with_bsr_from_triplets_topology_only(test, device):
     np.testing.assert_array_equal(A.columns.numpy()[:2], np.array([1, 2], dtype=np.int32))
 
 
+def test_capture_with_empty_bsr_assign(test, device):
+    """Verify that an empty compact assignment must clear topology when a CPU APIC graph replays."""
+    rows = wp.array([0], dtype=wp.int32, device=device)
+    columns = wp.array([0], dtype=wp.int32, device=device)
+    values = wp.array([1.0], dtype=wp.float32, device=device)
+    dest = bsr_from_triplets(2, 2, rows, columns, values)
+    empty = bsr_zeros(2, 2, block_type=wp.float32, device=device)
+
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        bsr_assign(dest, empty)
+
+    # CPU capture records without executing, so the original topology remains
+    # until replay. The empty assignment must not disappear from the APIC stream.
+    np.testing.assert_array_equal(dest.offsets.numpy(), np.array([0, 1, 1], dtype=np.int32))
+
+    wp.capture_launch(capture.graph)
+
+    np.testing.assert_array_equal(dest.offsets.numpy(), np.zeros(3, dtype=np.int32))
+
+
+def test_save_load_bsr_from_triplets_cuda(test, device):
+    """Verify that a loaded CUDA APIC graph rebuilds the native BSR topology operation."""
+    n = 8
+    rows = wp.zeros(n, dtype=wp.int32, device=device)
+    columns = wp.zeros(n, dtype=wp.int32, device=device)
+    values = wp.zeros(n, dtype=wp.float32, device=device)
+
+    # Compile the sparse value-accumulation kernel before stream capture.
+    bsr_from_triplets(n, n, rows, columns, values)
+    wp.synchronize_device(device)
+
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(fill_diag_triplets_kernel, dim=n, inputs=[rows, columns, values], device=device)
+        A = bsr_from_triplets(n, n, rows, columns, values)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "bsr_from_triplets")
+        wp.capture_save(
+            capture.graph,
+            path,
+            outputs={"offsets": A.offsets, "columns": A.columns, "values": A.values},
+        )
+        loaded = wp.capture_load(path, device=device)
+        wp.capture_launch(loaded)
+        wp.synchronize_device(device)
+
+        offsets = wp.zeros_like(A.offsets)
+        columns_out = wp.zeros_like(A.columns)
+        values_out = wp.zeros_like(A.values)
+        loaded.get_param("offsets", offsets)
+        loaded.get_param("columns", columns_out)
+        loaded.get_param("values", values_out)
+
+        np.testing.assert_array_equal(offsets.numpy(), np.arange(n + 1, dtype=np.int32))
+        np.testing.assert_array_equal(columns_out.numpy()[:n], np.arange(n, dtype=np.int32))
+        np.testing.assert_allclose(values_out.numpy()[:n], np.arange(1, n + 1, dtype=np.float32))
+
+
+def test_save_load_bsr_set_from_triplets_padded_cuda(test, device):
+    """Reconstruct a padded CUDA BSR triplet build from compact scratch topology."""
+    n = 8
+    rows = wp.zeros(n, dtype=wp.int32, device=device)
+    columns = wp.zeros(n, dtype=wp.int32, device=device)
+    values = wp.zeros(n, dtype=wp.float32, device=device)
+
+    # Compile the padded scatter and value-accumulation kernels before capture.
+    warm = bsr_zeros(n, n, block_type=wp.float32, device=device, row_capacity=2)
+    bsr_set_from_triplets(warm, rows, columns, values, topology="padded")
+    wp.synchronize_device(device)
+
+    A = bsr_zeros(n, n, block_type=wp.float32, device=device, row_capacity=2)
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        wp.launch(fill_diag_triplets_kernel, dim=n, inputs=[rows, columns, values], device=device)
+        bsr_set_from_triplets(A, rows, columns, values, topology="padded")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "bsr_set_from_triplets_padded")
+        wp.capture_save(
+            capture.graph,
+            path,
+            outputs={
+                "offsets": A.offsets,
+                "row_counts": A.row_counts,
+                "columns": A.columns,
+                "values": A.values,
+            },
+        )
+        loaded = wp.capture_load(path, device=device)
+        wp.capture_launch(loaded)
+        wp.synchronize_device(device)
+
+        offsets = wp.zeros_like(A.offsets)
+        row_counts = wp.zeros_like(A.row_counts)
+        columns_out = wp.zeros_like(A.columns)
+        values_out = wp.zeros_like(A.values)
+        loaded.get_param("offsets", offsets)
+        loaded.get_param("row_counts", row_counts)
+        loaded.get_param("columns", columns_out)
+        loaded.get_param("values", values_out)
+
+        np.testing.assert_array_equal(offsets.numpy(), 2 * np.arange(n + 1, dtype=np.int32))
+        np.testing.assert_array_equal(row_counts.numpy(), np.ones(n, dtype=np.int32))
+        np.testing.assert_array_equal(columns_out.numpy().reshape(n, 2)[:, 0], np.arange(n, dtype=np.int32))
+        np.testing.assert_allclose(values_out.numpy().reshape(n, 2)[:, 0], np.arange(1, n + 1, dtype=np.float32))
+
+
+def test_save_load_bsr_axpy_mm_cuda(test, device):
+    """Reconstruct compact BSR addition and no-sync multiplication topology."""
+    rows_a = wp.array([0, 0, 1], dtype=wp.int32, device=device)
+    columns_a = wp.array([0, 1, 1], dtype=wp.int32, device=device)
+    values_a = wp.array([1.0, 2.0, 3.0], dtype=wp.float32, device=device)
+    A = bsr_from_triplets(2, 2, rows_a, columns_a, values_a)
+
+    rows_b = wp.array([0, 1, 1], dtype=wp.int32, device=device)
+    columns_b = wp.array([0, 0, 1], dtype=wp.int32, device=device)
+    values_b = wp.array([4.0, 5.0, 6.0], dtype=wp.float32, device=device)
+    B0 = bsr_from_triplets(2, 2, rows_b, columns_b, values_b)
+
+    axpy_work = bsr_axpy_work_arrays()
+    mm_work = bsr_mm_work_arrays()
+
+    # Warm generated kernels and persistent work buffers before stream capture.
+    warm_b = bsr_copy(B0)
+    warm_c = bsr_zeros(2, 2, block_type=wp.float32, device=device)
+    bsr_axpy(A, warm_b, work_arrays=axpy_work)
+    bsr_mm(A, warm_b, warm_c, work_arrays=mm_work, max_new_nnz=4, tile_size=-1)
+    wp.synchronize_device(device)
+
+    B = bsr_copy(B0)
+    C = bsr_zeros(2, 2, block_type=wp.float32, device=device)
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        bsr_axpy(A, B, work_arrays=axpy_work)
+        bsr_mm(A, B, C, work_arrays=mm_work, max_new_nnz=4, tile_size=-1)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "bsr_axpy_mm")
+        wp.capture_save(
+            capture.graph,
+            path,
+            outputs={"offsets": C.offsets, "columns": C.columns, "values": C.values},
+        )
+        loaded = wp.capture_load(path, device=device)
+        wp.capture_launch(loaded)
+        wp.synchronize_device(device)
+
+        offsets = wp.zeros_like(C.offsets)
+        columns = wp.zeros_like(C.columns)
+        values = wp.zeros_like(C.values)
+        loaded.get_param("offsets", offsets)
+        loaded.get_param("columns", columns)
+        loaded.get_param("values", values)
+
+        np.testing.assert_array_equal(offsets.numpy(), np.array([0, 2, 4], dtype=np.int32))
+        np.testing.assert_array_equal(columns.numpy()[:4], np.array([0, 1, 0, 1], dtype=np.int32))
+        np.testing.assert_allclose(values.numpy()[:4], np.array([15.0, 20.0, 15.0, 27.0], dtype=np.float32))
+
+    unsized = bsr_zeros(2, 2, block_type=wp.float32, device=device)
+    with test.assertRaisesRegex(RuntimeError, "requires either"):
+        with wp.ScopedCapture(device=device, apic=True, force_module_load=False):
+            bsr_mm(A, B0, unsized)
+
+
+def test_save_load_bsr_mm_reuse_topology_cuda(test, device):
+    """Verify that CUDA APIC reconstructs ``bsr_mm(reuse_topology=True)`` without readback."""
+    A = bsr_from_triplets(
+        2,
+        2,
+        wp.array([0, 0, 1], dtype=wp.int32, device=device),
+        wp.array([0, 1, 1], dtype=wp.int32, device=device),
+        wp.array([1.0, 2.0, 3.0], dtype=wp.float32, device=device),
+    )
+    B = bsr_from_triplets(
+        2,
+        2,
+        wp.array([0, 1, 1], dtype=wp.int32, device=device),
+        wp.array([0, 0, 1], dtype=wp.int32, device=device),
+        wp.array([4.0, 5.0, 6.0], dtype=wp.float32, device=device),
+    )
+    C = bsr_zeros(2, 2, block_type=wp.float32, device=device)
+    work = bsr_mm_work_arrays()
+
+    # Populate the reusable topology and compile the values kernel outside capture.
+    bsr_mm(A, B, C, work_arrays=work, tile_size=-1)
+    wp.synchronize_device(device)
+
+    with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+        bsr_mm(A, B, C, work_arrays=work, reuse_topology=True, tile_size=-1)
+
+    # Make the semantic topology record load-bearing in the saved graph.
+    C.offsets.zero_()
+    C.columns.fill_(-1)
+    C.values.zero_()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "bsr_mm_reuse_topology")
+        wp.capture_save(
+            capture.graph,
+            path,
+            outputs={"offsets": C.offsets, "columns": C.columns, "values": C.values},
+        )
+        loaded = wp.capture_load(path, device=device)
+        wp.capture_launch(loaded)
+        wp.synchronize_device(device)
+
+        offsets = wp.zeros_like(C.offsets)
+        columns = wp.zeros_like(C.columns)
+        values = wp.zeros_like(C.values)
+        loaded.get_param("offsets", offsets)
+        loaded.get_param("columns", columns)
+        loaded.get_param("values", values)
+
+        np.testing.assert_array_equal(offsets.numpy(), np.array([0, 2, 4], dtype=np.int32))
+        np.testing.assert_array_equal(columns.numpy()[:4], np.array([0, 1, 0, 1], dtype=np.int32))
+        np.testing.assert_allclose(values.numpy()[:4], np.array([14.0, 12.0, 15.0, 18.0], dtype=np.float32))
+
+
 def test_capture_with_bsr_transpose(test, device):
-    """Regression: wp.sparse.bsr_transposed on CPU computes the transposed topology
+    """Recompute compact BSR transpose topology during APIC replay and reload.
+
+    Regression: wp.sparse.bsr_transposed on CPU computes the transposed topology
     via a host function (wp_bsr_transpose_host) that was invisible to the APIC byte
     stream. The source matrix is (re)assembled from triplets produced inside the
     capture, so replay must recompute both the from-triplets and the transpose
     topology."""
     from warp.sparse import bsr_set_from_triplets, bsr_set_transpose, bsr_zeros  # noqa: PLC0415
 
-    n = 6
+    n = 65
     rows = wp.zeros(n, dtype=wp.int32, device=device)
     columns = wp.zeros(n, dtype=wp.int32, device=device)
     values = wp.zeros(n, dtype=wp.float32, device=device)
     A = bsr_zeros(n, n, block_type=wp.float32, device=device)
     At = bsr_zeros(n, n, block_type=wp.float32, device=device)
 
+    if device.is_cuda:
+        bsr_set_from_triplets(A, rows, columns, values)
+        bsr_set_transpose(At, A)
     wp.load_module(device=device)
     with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
         wp.launch(fill_diag_triplets_kernel, dim=n, inputs=[rows, columns, values], device=device)
@@ -2411,14 +4288,31 @@ def test_capture_with_bsr_transpose(test, device):
     wp.capture_launch(capture.graph)
     wp.synchronize_device(device)
 
-    # Diagonal matrix transposes to itself: nnz=6, columns=[0..5], values=[1..6].
+    # The diagonal matrix transposes to itself.
     test.assertEqual(int(At.offsets.numpy()[n]), n)
     np.testing.assert_array_equal(At.columns.numpy()[:n], np.arange(n, dtype=np.int32))
     np.testing.assert_allclose(At.values.numpy()[:n], np.arange(1, n + 1, dtype=np.float32))
 
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "bsr_transpose")
+        wp.capture_save(
+            capture.graph, path, outputs={"offsets": At.offsets, "columns": At.columns, "values": At.values}
+        )
+        loaded = wp.capture_load(path, device=device)
+        wp.capture_launch(loaded)
+        offsets_out = wp.zeros_like(At.offsets)
+        columns_out = wp.zeros_like(At.columns)
+        values_out = wp.zeros_like(At.values)
+        loaded.get_param("offsets", offsets_out)
+        loaded.get_param("columns", columns_out)
+        loaded.get_param("values", values_out)
+        np.testing.assert_array_equal(offsets_out.numpy(), np.arange(n + 1, dtype=np.int32))
+        np.testing.assert_array_equal(columns_out.numpy()[:n], np.arange(n, dtype=np.int32))
+        np.testing.assert_array_equal(values_out.numpy()[:n], np.arange(1, n + 1, dtype=np.float32))
+
 
 def test_capture_with_padded_bsr_transpose(test, device):
-    """Padded BSR transpose replay must preserve row_counts and status pointers."""
+    """Verify that padded BSR transpose replay must preserve row_counts and status pointers."""
     from warp.sparse import (  # noqa: PLC0415
         BSR_STATUS_ROW_CAPACITY_EXCEEDED,
         bsr_set_from_triplets,
@@ -2468,7 +4362,9 @@ def test_capture_with_padded_bsr_transpose(test, device):
 
 
 def test_capture_padded_bsr_transpose_rebuilds_offsets(test, device):
-    """Regression: the padded BSR transpose reads the destination's
+    """Rebuild padded BSR transpose offsets during APIC replay.
+
+    Regression: the padded BSR transpose reads the destination's
     row-capacity offsets but never writes them, so an APIC replay that found
     those offsets zeroed before capture_launch reconstructed nothing. The capture
     now restores the capacity layout (CPU from the recorded op, CUDA from a
@@ -2512,7 +4408,9 @@ def test_capture_padded_bsr_transpose_rebuilds_offsets(test, device):
 
 
 def test_save_load_padded_bsr_transpose_cuda_rebuild(test, device):
-    """Save/load of a CUDA APIC padded bsr_set_transpose graph. The transpose
+    """Rebuild a saved CUDA APIC padded BSR transpose graph.
+
+    Save/load of a CUDA APIC padded bsr_set_transpose graph. The transpose
     allocates block-index scratch during capture (graph-scoped on a memory-pool
     device); capture_save stores that region's size only (its content regenerates
     on replay), and the rebuild (apic_replay_ops_into_cuda_capture) sizes the
@@ -2665,7 +4563,9 @@ def test_save_load_padded_bsr_transpose_too_small(test, device):
 
 
 def test_apic_cpu_op_not_rejected_under_cuda_capture(test, device):
-    """Device-scoping: the CPU-only ``NotImplementedError`` guards for
+    """Allow unrelated CPU operations during CUDA APIC capture.
+
+    Device-scoping: the CPU-only ``NotImplementedError`` guards for
     non-contiguous ``fill_()`` / ``wp.copy()`` are scoped to a CPU APIC capture
     via ``apic_capture.device == array.device``. ``runtime._apic_capture`` is
     global, so a CUDA APIC capture active on ``device`` must not falsely reject
@@ -2687,7 +4587,9 @@ def test_apic_cpu_op_not_rejected_under_cuda_capture(test, device):
 
 
 def test_apic_cpu_ops_scoped_to_capture_device(test, device):
-    """Device-scoping: a CPU ``wp.launch`` / ``capture_if`` / ``capture_while``
+    """Execute CPU graph operations live during CUDA APIC capture.
+
+    Device-scoping: a CPU ``wp.launch`` / ``capture_if`` / ``capture_while``
     issued during a CUDA APIC capture must execute immediately on the host, not be
     recorded into the global ``runtime._apic_capture`` (which targets the CUDA device).
     Each guard checks ``runtime._apic_capture.device == device``; otherwise the CPU op
@@ -2731,7 +4633,9 @@ def test_apic_cpu_ops_scoped_to_capture_device(test, device):
 
 
 def test_apic_capture_resume_rejects_finished_graph(test, device):
-    """A CPU APIC graph keeps its capture object after capture_end()
+    """Reject resuming a finished CPU APIC graph.
+
+    A CPU APIC graph keeps its capture object after capture_end()
     so it can be replayed. capture_resume() must refuse to restart recording on
     a finished (never-paused) graph rather than silently reopening it."""
     from warp._src.context import capture_resume  # noqa: PLC0415
@@ -2752,7 +4656,9 @@ def test_apic_capture_resume_rejects_finished_graph(test, device):
 
 
 def test_capture_auto_register_unknown_pointer_cpu(test, device):
-    """``wp_memset_host`` against a pointer APIC's tracker has never seen
+    """Register unknown host pointers during CPU APIC capture.
+
+    ``wp_memset_host`` against a pointer APIC's tracker has never seen
     previously dropped the op and emitted an error; the resulting graph
     replayed as a no-op and left the buffer non-zero. The recording hooks
     now auto-register unknown pointers as fresh regions so capture + replay
@@ -2783,7 +4689,7 @@ def test_capture_auto_register_unknown_pointer_cpu(test, device):
 
 
 def test_save_load_auto_registered_native_pointer_cpu(test, device):
-    """Native-only auto-registered host regions must survive save/load.
+    """Verify that native-only auto-registered host regions must survive save/load.
 
     The scratch pointer below never flows through Python's APIC tracker. It is
     registered only by the native host hooks, then used as the source for a raw
@@ -2829,7 +4735,9 @@ def test_save_load_auto_registered_native_pointer_cpu(test, device):
 
 
 def test_end_recording_null_state_preserves_active(test, device):
-    """wp_apic_end_recording(nullptr) must not clobber g_apic_state when
+    """Preserve active APIC state when ending a null recording.
+
+    wp_apic_end_recording(nullptr) must not clobber g_apic_state when
     another (valid) recording is active. Regression for Greptile fb1661ef.
     """
     n = 64
@@ -2866,7 +4774,9 @@ def test_end_recording_null_state_preserves_active(test, device):
 
 
 def test_get_param_ptr(test, device):
-    """get_param_ptr returns a non-zero int for a known name, None for an unknown
+    """Return graph parameter pointers for known names only.
+
+    get_param_ptr returns a non-zero int for a known name, None for an unknown
     name, and raises RuntimeError on a non-loaded graph."""
     n = 64
     a = wp.array(np.ones(n, dtype=np.float32), device=device)
@@ -2899,7 +4809,9 @@ def test_get_param_ptr(test, device):
 
 
 def test_capture_save_aborts_on_mesh_registration_failure(test, device):
-    """A device mesh whose arrays cannot be device-to-host snapshotted during
+    """Abort APIC saves when mesh registration fails.
+
+    A device mesh whose arrays cannot be device-to-host snapshotted during
     capture_save must abort the save loudly rather than silently emit a ``.wrp``
     missing the mesh's data. A real ``cudaMemcpy`` failure is not deterministically
     inducible from Python, so this stubs the native mesh registration to report
@@ -2925,7 +4837,9 @@ def test_capture_save_aborts_on_mesh_registration_failure(test, device):
 
 
 def test_capture_save_aborts_on_region_snapshot_failure(test, device):
-    """A device-region device-to-host snapshot failure during capture_save must
+    """Abort APIC saves when a region snapshot fails.
+
+    A device-region device-to-host snapshot failure during capture_save must
     abort the save (wp_apic_state_save returns false) instead of writing a ``.wrp``
     missing a referenced region's initial data. A real ``cudaMemcpy`` failure is not
     deterministically inducible from Python, so this stubs wp_apic_state_save to
@@ -3064,7 +4978,7 @@ def test_capture_with_bvh_rebuild_save_rejected(test, device):
 
 
 def test_discarded_bvh_op_does_not_block_save(test, device):
-    """A BVH op discarded when a branch body unwinds must not block a later save.
+    """Verify that a BVH op discarded when a branch body unwinds must not block a later save.
 
     Non-serializability is derived from the finalized operation stream, not from
     a flag set when the op is recorded. So recording a BVH refit inside a branch
@@ -3105,6 +5019,9 @@ devices_with_cuda_graph_module_load = get_test_devices_with_cuda_graph_module_lo
 devices_with_graph_capture_allocation_and_cuda_graph_module_load = (
     get_test_devices_with_graph_capture_allocation_and_cuda_graph_module_load()
 )
+cuda_devices_with_graph_capture_allocation_and_cuda_graph_module_load = [
+    d for d in devices_with_graph_capture_allocation_and_cuda_graph_module_load if d.is_cuda
+]
 
 add_function_test(
     TestApic,
@@ -3156,8 +5073,26 @@ add_function_test(
 )
 add_function_test(
     TestApic,
+    "test_capture_load_rejects_memtile_span_overflow",
+    test_capture_load_rejects_memtile_span_overflow,
+    devices=[d for d in devices if d.is_cpu],
+)
+add_function_test(
+    TestApic,
+    "test_capture_load_rejects_zero_memtile_srcsize",
+    test_capture_load_rejects_zero_memtile_srcsize,
+    devices=[d for d in devices if d.is_cpu],
+)
+add_function_test(
+    TestApic,
     "test_capture_load_rejects_malformed_memory_regions",
     test_capture_load_rejects_malformed_memory_regions,
+    devices=[d for d in devices if d.is_cpu],
+)
+add_function_test(
+    TestApic,
+    "test_capture_load_rejects_out_of_bounds_sections",
+    test_capture_load_rejects_out_of_bounds_sections,
     devices=[d for d in devices if d.is_cpu],
 )
 add_function_test(
@@ -3174,8 +5109,87 @@ add_function_test(
 )
 add_function_test(
     TestApic,
+    "test_load_accepts_current_oversized_no_tid_launch_shape",
+    test_load_accepts_current_oversized_no_tid_launch_shape,
+    devices=[d for d in devices if d.is_cpu],
+)
+add_function_test(
+    TestApic,
     "test_save_load_round_trip",
     test_save_load_round_trip,
+    devices=devices_with_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_load_same_capture_twice",
+    test_load_same_capture_twice,
+    devices=devices_with_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_save_load_large_shared_memory",
+    test_save_load_large_shared_memory,
+    devices=[d for d in devices_with_cuda_graph_module_load if d.is_cuda],
+)
+add_function_test(
+    TestApic,
+    "test_save_load_large_shared_memory_conditional",
+    test_save_load_large_shared_memory,
+    devices=[d for d in devices_with_cuda_graph_module_load if d.is_cuda],
+    conditional=True,
+)
+add_function_test(
+    TestApic,
+    "test_save_load_large_shared_memory_backward",
+    test_save_load_large_shared_memory_backward,
+    devices=[d for d in devices_with_cuda_graph_module_load if d.is_cuda],
+)
+add_function_test(
+    TestApic,
+    "test_cuda_source_fallback_and_guest_cache",
+    test_cuda_source_fallback_and_guest_cache,
+    devices=[d for d in devices_with_cuda_graph_module_load if d.is_cuda],
+)
+add_function_test(
+    TestApic,
+    "test_cuda_packaged_binary_fast_path",
+    test_cuda_packaged_binary_fast_path,
+    devices=[d for d in devices_with_cuda_graph_module_load if d.is_cuda],
+)
+add_function_test(
+    TestApic,
+    "test_cuda_source_enabled_capture_load_from_bytes",
+    test_cuda_source_enabled_capture_load_from_bytes,
+    devices=[d for d in devices_with_cuda_graph_module_load if d.is_cuda],
+)
+add_function_test(
+    TestApic,
+    "test_cuda_source_fallback_reports_missing_source",
+    test_cuda_source_fallback_reports_missing_source,
+    devices=[d for d in devices_with_cuda_graph_module_load if d.is_cuda],
+)
+add_function_test(
+    TestApic,
+    "test_cuda_source_fallback_rejects_mathdx_link_inputs",
+    test_cuda_source_fallback_rejects_mathdx_link_inputs,
+    devices=[d for d in devices_with_cuda_graph_module_load if d.is_cuda],
+)
+add_function_test(
+    TestApic,
+    "test_capture_save_binary_only_cuda_module",
+    test_capture_save_binary_only_cuda_module,
+    devices=[d for d in devices_with_cuda_graph_module_load if d.is_cuda],
+)
+add_function_test(
+    TestApic,
+    "test_capture_save_binary_only_after_source_fallback",
+    test_capture_save_binary_only_after_source_fallback,
+    devices=[d for d in devices_with_cuda_graph_module_load if d.is_cuda],
+)
+add_function_test(
+    TestApic,
+    "test_capture_save_failed_overwrite_remains_replayable",
+    test_capture_save_failed_overwrite_remains_replayable,
     devices=devices_with_cuda_graph_module_load,
 )
 add_function_test(
@@ -3235,9 +5249,7 @@ add_function_test(
     test_cpu_graph_replay_after_array_refs_released,
     devices=[d for d in devices if d.is_cpu],
 )
-add_function_test(
-    TestApic, "test_save_load_fill", test_save_load_fill, devices=get_cuda_test_devices()
-)  # CPU: wp_memtile_host not recorded
+add_function_test(TestApic, "test_save_load_fill", test_save_load_fill, devices=devices)
 add_function_test(
     TestApic, "test_save_load_alloc_only", test_save_load_alloc_only, devices=devices_with_graph_capture_allocation
 )
@@ -3319,8 +5331,32 @@ add_function_test(
 )
 add_function_test(
     TestApic,
+    "test_capture_with_negative_axis_array_reductions",
+    test_capture_with_negative_axis_array_reductions,
+    devices=devices_with_graph_capture_allocation,
+)
+add_function_test(
+    TestApic,
     "test_array_reduction_capture_errors",
     test_array_reduction_capture_errors,
+    devices=devices_with_graph_capture_allocation_and_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_array_reduction_count_bounds_during_capture",
+    test_array_reduction_count_bounds_during_capture,
+    devices=devices_with_graph_capture_allocation_and_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_strided_whole_array_reductions_during_capture",
+    test_strided_whole_array_reductions_during_capture,
+    devices=devices_with_graph_capture_allocation_and_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_compact_whole_array_reductions_during_capture",
+    test_compact_whole_array_reductions_during_capture,
     devices=devices_with_graph_capture_allocation_and_cuda_graph_module_load,
 )
 add_function_test(
@@ -3379,9 +5415,39 @@ add_function_test(
 )
 add_function_test(
     TestApic,
+    "test_capture_with_empty_bsr_assign",
+    test_capture_with_empty_bsr_assign,
+    devices=[d for d in devices if d.is_cpu],
+)
+add_function_test(
+    TestApic,
+    "test_save_load_bsr_from_triplets_cuda",
+    test_save_load_bsr_from_triplets_cuda,
+    devices=cuda_devices_with_graph_capture_allocation_and_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_save_load_bsr_set_from_triplets_padded_cuda",
+    test_save_load_bsr_set_from_triplets_padded_cuda,
+    devices=cuda_devices_with_graph_capture_allocation_and_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_save_load_bsr_axpy_mm_cuda",
+    test_save_load_bsr_axpy_mm_cuda,
+    devices=cuda_devices_with_graph_capture_allocation_and_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
+    "test_save_load_bsr_mm_reuse_topology_cuda",
+    test_save_load_bsr_mm_reuse_topology_cuda,
+    devices=cuda_devices_with_graph_capture_allocation_and_cuda_graph_module_load,
+)
+add_function_test(
+    TestApic,
     "test_capture_with_bsr_transpose",
     test_capture_with_bsr_transpose,
-    devices=[d for d in devices if d.is_cpu],
+    devices=devices,
 )
 add_function_test(
     TestApic,
@@ -3562,6 +5628,14 @@ add_function_test(
     "test_capture_save_aborts_on_region_snapshot_failure",
     test_capture_save_aborts_on_region_snapshot_failure,
     devices=devices_with_cuda_graph_module_load,
+)
+
+
+add_function_test(
+    TestApic,
+    "test_save_load_block_dependent_static_kernel",
+    test_save_load_block_dependent_static_kernel,
+    devices=get_cuda_test_devices(),
 )
 
 

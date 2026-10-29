@@ -11,7 +11,6 @@ import inspect
 import math
 import operator
 import struct
-import sys
 import types
 import zlib
 from collections.abc import Callable, Mapping, Sequence
@@ -33,6 +32,12 @@ import numpy as np
 import warp
 import warp.config
 from warp._src.logger import log_warning
+
+# NumPy versions before 2.4 incorrectly take an undocumented scalar path when
+# ``__array_interface__`` exposes a NULL data pointer. Keep a valid byte alive
+# for empty arrays so those versions can consume the interface.
+# https://github.com/numpy/numpy/issues/26037
+_ARRAY_INTERFACE_EMPTY_DATA = ctypes.c_byte()
 
 # type hints
 T = TypeVar("T")
@@ -255,6 +260,9 @@ class int_base(scalar_base):
 class bool:
     """Boolean scalar type for use in Warp kernels and arrays."""
 
+    __numpy_dtype__: ClassVar[np.dtype[np.bool_]] = np.dtype(np.bool_)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
+
     _length_ = 1
     _type_ = ctypes.c_bool
 
@@ -280,6 +288,9 @@ class bool:
 class float16(float_base):
     """16-bit half-precision floating-point scalar type."""
 
+    __numpy_dtype__: ClassVar[np.dtype[np.float16]] = np.dtype(np.float16)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
+
     _length_ = 1
     _type_ = ctypes.c_uint16
 
@@ -294,12 +305,18 @@ class bfloat16(float_base):
 class float32(float_base):
     """32-bit single-precision floating-point scalar type."""
 
+    __numpy_dtype__: ClassVar[np.dtype[np.float32]] = np.dtype(np.float32)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
+
     _length_ = 1
     _type_ = ctypes.c_float
 
 
 class float64(float_base):
     """64-bit double-precision floating-point scalar type."""
+
+    __numpy_dtype__: ClassVar[np.dtype[np.float64]] = np.dtype(np.float64)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
 
     _length_ = 1
     _type_ = ctypes.c_double
@@ -308,12 +325,18 @@ class float64(float_base):
 class int8(int_base):
     """8-bit signed integer scalar type."""
 
+    __numpy_dtype__: ClassVar[np.dtype[np.int8]] = np.dtype(np.int8)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
+
     _length_ = 1
     _type_ = ctypes.c_int8
 
 
 class uint8(int_base):
     """8-bit unsigned integer scalar type."""
+
+    __numpy_dtype__: ClassVar[np.dtype[np.uint8]] = np.dtype(np.uint8)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
 
     _length_ = 1
     _type_ = ctypes.c_uint8
@@ -322,12 +345,18 @@ class uint8(int_base):
 class int16(int_base):
     """16-bit signed integer scalar type."""
 
+    __numpy_dtype__: ClassVar[np.dtype[np.int16]] = np.dtype(np.int16)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
+
     _length_ = 1
     _type_ = ctypes.c_int16
 
 
 class uint16(int_base):
     """16-bit unsigned integer scalar type."""
+
+    __numpy_dtype__: ClassVar[np.dtype[np.uint16]] = np.dtype(np.uint16)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
 
     _length_ = 1
     _type_ = ctypes.c_uint16
@@ -336,12 +365,18 @@ class uint16(int_base):
 class int32(int_base):
     """32-bit signed integer scalar type."""
 
+    __numpy_dtype__: ClassVar[np.dtype[np.int32]] = np.dtype(np.int32)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
+
     _length_ = 1
     _type_ = ctypes.c_int32
 
 
 class uint32(int_base):
     """32-bit unsigned integer scalar type."""
+
+    __numpy_dtype__: ClassVar[np.dtype[np.uint32]] = np.dtype(np.uint32)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
 
     _length_ = 1
     _type_ = ctypes.c_uint32
@@ -350,6 +385,9 @@ class uint32(int_base):
 class int64(int_base):
     """64-bit signed integer scalar type."""
 
+    __numpy_dtype__: ClassVar[np.dtype[np.int64]] = np.dtype(np.int64)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
+
     _length_ = 1
     _type_ = ctypes.c_int64
 
@@ -357,15 +395,18 @@ class int64(int_base):
 class uint64(int_base):
     """64-bit unsigned integer scalar type."""
 
+    __numpy_dtype__: ClassVar[np.dtype[np.uint64]] = np.dtype(np.uint64)
+    """Equivalent NumPy dtype, recognized by NumPy 2.4 and later."""
+
     _length_ = 1
     _type_ = ctypes.c_uint64
 
 
 class handle(uint64):
-    """Type for object handles (Mesh, Volume, BVH) in kernel parameters.
+    """Type for object handles (Mesh, Volume, BVH) in kernel parameters, struct fields, and arrays.
 
     Behaves identically to ``uint64`` but allows APIC to detect which
-    parameters need pointer remapping during graph replay.
+    values need pointer remapping during graph replay.
     """
 
     _wp_native_name_ = "uint64"
@@ -383,9 +424,41 @@ native_scalar_types = (int32, float32, bool)
 
 # TypeVars with proper constraints now that scalar types are defined
 # Note: TypeVar constraints must be listed explicitly (Pyright doesn't support unpacking)
-# Keep these in sync with the tuples above when adding new scalar types
+# Keep these (and their docstrings) in sync with the tuples above when adding new scalar types
 Int = TypeVar("Int", int, int8, uint8, int16, uint16, int32, uint32, int64, uint64)
+"""Generic annotation for any Warp integer scalar type.
+
+Use ``Int`` to annotate parameters of generic Warp kernels and functions,
+either directly or as the ``dtype`` of a generic array, vector, or matrix.
+``Int`` matches the following integer types:
+
+- :class:`~warp.int8`, :class:`~warp.int16`, :class:`~warp.int32`, or :class:`~warp.int64`.
+- :class:`~warp.uint8`, :class:`~warp.uint16`, :class:`~warp.uint32`, or :class:`~warp.uint64`.
+- Python :class:`int`, which Warp treats as :class:`~warp.int32`.
+
+Use :data:`~warp.Scalar` to accept both integer and floating-point types.
+
+For more on writing generic kernels and functions with ``Int``, see
+:ref:`generic_type_annotations`.
+"""
+
 Float = TypeVar("Float", float, float16, bfloat16, float32, float64)
+"""Generic annotation for any Warp floating-point scalar type.
+
+Use ``Float`` to annotate parameters of generic Warp kernels and functions,
+either directly or as the ``dtype`` of a generic array, vector, or matrix.
+``Float`` matches the following floating-point types:
+
+- :class:`~warp.float16`, :class:`~warp.float32`, or :class:`~warp.float64`.
+- :class:`~warp.bfloat16`.
+- Python :class:`float`, which Warp treats as :class:`~warp.float32`.
+
+Use :data:`~warp.Scalar` to accept both integer and floating-point types.
+
+For more on writing generic kernels and functions with ``Float``, see
+:ref:`generic_type_annotations`.
+"""
+
 Scalar = TypeVar(
     "Scalar",
     int,
@@ -403,6 +476,24 @@ Scalar = TypeVar(
     float32,
     float64,
 )
+"""Generic annotation for any Warp integer or floating-point scalar type.
+
+Use ``Scalar`` to annotate parameters of generic Warp kernels and functions,
+either directly or as the ``dtype`` of a generic array, vector, or matrix.
+``Scalar`` matches the types that :data:`~warp.Int` and :data:`~warp.Float` match:
+
+- :class:`~warp.int8`, :class:`~warp.int16`, :class:`~warp.int32`, or :class:`~warp.int64`.
+- :class:`~warp.uint8`, :class:`~warp.uint16`, :class:`~warp.uint32`, or :class:`~warp.uint64`.
+- :class:`~warp.float16`, :class:`~warp.float32`, or :class:`~warp.float64`.
+- :class:`~warp.bfloat16`.
+- Python :class:`int` or :class:`float`, which Warp treats as :class:`~warp.int32`
+  or :class:`~warp.float32`, respectively.
+
+:class:`~warp.bool` doesn't match ``Scalar``.
+
+For more on writing generic kernels and functions with ``Scalar``, see
+:ref:`generic_type_annotations`.
+"""
 
 
 def _unwrap_literal(value):
@@ -858,6 +949,10 @@ def vector(length, dtype):
     elif dtype is builtins.bool:
         dtype = bool
 
+    # A component name is one of the first `length` letters of "xyzw", the same
+    # names `Adjoint.vector_component_index` accepts inside a kernel.
+    component_indices = {} if length is Any else {c: i for i, c in enumerate("xyzw"[:length])}
+
     class vec_t(ctypes.Array):
         # ctypes.Array data for length, shape and c type:
         _length_ = 0 if length is Any else length
@@ -1004,16 +1099,22 @@ def vector(length, dtype):
                 raise KeyError(f"Invalid key {key}, expected int or slice")
 
         def __getattr__(self, name):
-            idx = "xyzw".find(name)
-            if idx != -1:
+            idx = component_indices.get(name)
+            if idx is not None:
                 return self.__getitem__(idx)
 
             return self.__getattribute__(name)
 
         def __setattr__(self, name, value):
-            idx = "xyzw".find(name)
-            if idx != -1:
+            idx = component_indices.get(name)
+            if idx is not None:
                 return self.__setitem__(idx, value)
+
+            # A name spelled entirely from component letters asks for a
+            # component, so storing it as an attribute would shadow the vector
+            # without touching it. Names outside that alphabet stay assignable.
+            if name and not name.strip("xyzw"):
+                raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
             return super().__setattr__(name, value)
 
@@ -1084,7 +1185,11 @@ def vector(length, dtype):
 @functools.cache
 def matrix(shape, dtype):
     """Create a matrix type with the given shape and data type."""
-    assert len(shape) == 2
+    if len(shape) != 2:
+        dimension_label = "dimension" if len(shape) == 1 else "dimensions"
+        raise ValueError(
+            f"Matrix shape must have exactly two dimensions, got {len(shape)} {dimension_label} in shape {shape!r}"
+        )
 
     # canonicalize dtype
     if dtype is int:
@@ -1383,7 +1488,6 @@ def matrix(shape, dtype):
                         values = tuple(col_vec[x] for x in rows)
                         return vector(len(values), self._wp_scalar_type_)(*values)
 
-                assert ndim == 2
                 rows = range(*key[0].indices(self._shape_[1]))
                 cols = range(*key[1].indices(self._shape_[0]))
                 row_vecs = tuple(self.get_row(i) for i in rows)
@@ -1468,8 +1572,6 @@ def matrix(shape, dtype):
                             super().__setitem__(idx, mat_t.scalar_import(value[i] if v_shape else value))
 
                         return
-
-                assert ndim == 2
 
                 _, v_shape = flatten(value)
 
@@ -2109,6 +2211,7 @@ warp_type_to_np_dtype = {
     uint16: np.uint16,
     uint32: np.uint32,
     uint64: np.uint64,
+    handle: np.uint64,
     float16: np.float16,
     bfloat16: np.uint16,  # TODO: Use ml_dtypes.bfloat16 when available (see also _np_float32_to_bfloat16_bits)
     float32: np.float32,
@@ -2180,9 +2283,39 @@ class range_t:
 
 # definition just for kernel type (cannot be a parameter), see bvh.h
 class BvhQuery:
-    """Object used to track state during BVH traversal."""
+    """Object used to track state during BVH traversal.
+
+    Erased parent of the concrete query-kind tags: codegen produces this type only
+    when the concrete kind is lost (a branch merging two kinds, or a function
+    parameter annotated with the parent). Iteration then dispatches on the kind
+    stored in the query at construction.
+    """
 
     _wp_native_name_ = "bvh_query_t"
+
+
+class _BvhQueryAabb(BvhQuery):
+    """Internal dispatch type for AABB queries. Users see BvhQuery."""
+
+    _wp_erase_to_ = BvhQuery
+
+
+class _BvhQueryRay(BvhQuery):
+    """Internal dispatch type for ray queries. Users see BvhQuery."""
+
+    _wp_erase_to_ = BvhQuery
+
+
+class _BvhQueryCapsule(BvhQuery):
+    """Internal dispatch type for capsule queries. Users see BvhQuery."""
+
+    _wp_erase_to_ = BvhQuery
+
+
+class _BvhQuerySphere(BvhQuery):
+    """Internal dispatch type for sphere queries. Users see BvhQuery."""
+
+    _wp_erase_to_ = BvhQuery
 
 
 class BvhQueryTiled:
@@ -2192,10 +2325,32 @@ class BvhQueryTiled:
 
 
 # definition just for kernel type (cannot be a parameter), see mesh.h
-class MeshQueryAABB:
-    """Object used to track state during mesh traversal."""
+class MeshQuery:
+    """Object used to track state during mesh traversal.
+
+    Erased parent of the concrete query-kind tags: codegen produces this type only
+    when the concrete kind is lost (a branch merging two kinds, or a function
+    parameter annotated with the parent). Iteration then dispatches on the kind
+    stored in the query at construction.
+    """
 
     _wp_native_name_ = "mesh_query_aabb_t"
+
+
+class MeshQueryAABB(MeshQuery):
+    """Object used to track state during a mesh AABB query.
+
+    The concrete AABB query kind; public for backward compatibility with code
+    annotated against the pre-1.17 type name.
+    """
+
+    _wp_erase_to_ = MeshQuery
+
+
+class _MeshQuerySphere(MeshQuery):
+    """Internal dispatch type for sphere mesh queries. Users see MeshQuery."""
+
+    _wp_erase_to_ = MeshQuery
 
 
 class MeshQueryAABBTiled:
@@ -2283,7 +2438,7 @@ def _make_launch_bounds_class(ndim: int):
         (ctypes.Structure,),
         {
             "_fields_": (
-                ("shape", ctypes.c_int32 * ndim),
+                ("shape", ctypes.c_uint32 * ndim),
                 ("size", ctypes.c_size_t),
                 ("coord_mult", ctypes.c_size_t),
             ),
@@ -2532,7 +2687,9 @@ def type_size_in_bytes(dtype: type) -> int:
     size = _type_size_cache.get(dtype)
 
     if size is None:
-        if dtype.__module__ == "ctypes":
+        if is_native_type(dtype):
+            size = ctypes.sizeof(dtype)
+        elif dtype.__module__ == "ctypes":
             size = ctypes.sizeof(dtype)
         elif hasattr(dtype, "_type_"):
             size = getattr(dtype, "_length_", 1) * ctypes.sizeof(dtype._type_)
@@ -2592,6 +2749,8 @@ def type_typestr(dtype: type) -> str:
         return "<u8"
     elif isinstance(dtype, warp._src.codegen.Struct):
         return f"|V{ctypes.sizeof(dtype.ctype)}"
+    elif is_native_type(dtype):
+        return f"|V{ctypes.sizeof(dtype)}"
     elif hasattr(dtype, "_wp_ctype_"):
         # texture types (Texture2D, Texture3D) have _wp_ctype_ pointing to their ctypes struct
         return f"|V{ctypes.sizeof(dtype._wp_ctype_)}"
@@ -2634,7 +2793,8 @@ def type_repr(t) -> str:
     if t is Any:
         return "Any"
     if is_array(t):
-        cls_name = concrete_array_type(t).__name__
+        # Diagnostics describe the Python object, while compiler types use its native family.
+        cls_name = t._concrete_cls.__name__ if isinstance(t, _ArrayAnnotationBase) else type(t).__name__
         if isinstance(t, _ArrayAnnotationBase) or (hasattr(t, "device") and t.device is None):
             # array is used as a type annotation - display ndim instead of shape
             ndim_repr = "Any" if t.ndim is Any else t.ndim
@@ -2734,6 +2894,12 @@ def type_is_composite(t):
 
 
 value_types = (int, float, builtins.bool, *scalar_and_bool_types)
+_native_value_types: set[type] = set()
+
+
+def is_native_type(t: Any) -> builtins.bool:
+    """Return whether ``t`` is a native value type registered through ``warp.build_experimental``."""
+    return isinstance(t, type) and t in _native_value_types
 
 
 def type_is_value(t: Any) -> builtins.bool:
@@ -2803,7 +2969,7 @@ def is_composite(x):
 
 def is_value(x: Any) -> builtins.bool:
     """Return ``True`` if the value is a value type instance (scalar, vector, matrix, quaternion, or transformation)."""
-    return isinstance(x, value_types) or is_composite(x)
+    return isinstance(x, value_types) or is_composite(x) or type(x) in _native_value_types
 
 
 def is_struct(x) -> builtins.bool:
@@ -2824,10 +2990,13 @@ def matches_array_class(t, cls) -> builtins.bool:
 
 
 def concrete_array_type(t) -> type:
-    """Return the concrete array class for an annotation or instance."""
-    if isinstance(t, _ArrayAnnotationBase):
+    """Return an array's native family, preserving ``type(t)`` for non-arrays."""
+    cls = type(t)
+    if issubclass(cls, _ArrayAnnotationBase):
         return t._concrete_cls
-    return type(t)
+    if id(cls) in _ARRAY_FAMILY_IDS:
+        return cls
+    return _resolve_array_family(t) or cls
 
 
 def is_tuple(x) -> builtins.bool:
@@ -2886,7 +3055,8 @@ def scalars_equal_generic(a, b, match_generic=True):
 
 
 def seq_match_ellipsis(a, b) -> bool:
-    assert a and a[-1] is Ellipsis and len(a) == 2
+    if not a or a[-1] is not Ellipsis or len(a) != 2:
+        raise TypeError(f"An ellipsis sequence pattern must contain one type followed by Ellipsis, got {a!r}")
 
     # Compare the args against the type being repeated through the ellipsis.
     repeated_arg = a[0]
@@ -3001,6 +3171,30 @@ def types_equal(a, b):
     if a is b:
         return True
     return types_equal_generic(a, b, match_generic=False)
+
+
+def type_erased_parent(t):
+    """Return the public erased parent of a query-kind dispatch type, or ``None``.
+
+    Concrete query-kind types (e.g. the internal subclasses of ``BvhQuery`` and
+    ``MeshQuery``) carry a ``_wp_erase_to_`` class attribute naming the public
+    parent they decay to when the concrete kind cannot be tracked statically.
+    """
+    if isinstance(t, type):
+        return getattr(t, "_wp_erase_to_", None)
+    return None
+
+
+def type_erasure_join(a, b):
+    """Return the common erased parent of two query-kind types, or ``None``.
+
+    Used by codegen to merge values whose types are sibling query-kind types (or a
+    concrete kind and its erased parent): the merged value decays to the parent,
+    whose iterator dispatches on the kind stored in the query object at runtime.
+    """
+    parent_a = type_erased_parent(a) or a
+    parent_b = type_erased_parent(b) or b
+    return parent_a if parent_a is parent_b else None
 
 
 def strides_from_shape(shape: tuple, dtype):
@@ -3195,10 +3389,10 @@ class array(Array[DType, NDim]):
         dtype (DType): The data type of the array.
         ndim (int): The number of array dimensions.
         size (int): The number of items in the array.
-        capacity (int): The amount of memory in bytes allocated for this array.
+        capacity (int): Maximum number of bytes addressable from ``ptr`` for this array.
         shape (tuple[int]): Dimensions of the array.
         strides (tuple[int]): Number of bytes in each dimension between successive elements of the array.
-        ptr (int): Pointer to underlying memory allocation backing the array.
+        ptr (int): Pointer to the array's first element. For a view, this may point inside a larger backing allocation.
         device (Device): The device where the array's memory allocation resides.
         pinned (bool): Indicates whether the array was allocated in pinned host memory.
         is_contiguous (bool): Indicates whether this array has a contiguous memory layout.
@@ -3267,8 +3461,9 @@ class array(Array[DType, NDim]):
             dtype: One of the available `data types <#data-types>`_, such as :class:`warp.float32`, :class:`warp.mat33`, or a custom `struct <#structs>`_. If dtype is ``Any`` and data is an ndarray, then it will be inferred from the array data type
             shape: Dimensions of the array
             strides: Number of bytes in each dimension between successive elements of the array
-            ptr: Address of an external memory address to alias (``data`` should be ``None``)
-            capacity: Maximum size in bytes of the ``ptr`` allocation (``data`` should be ``None``)
+            ptr: Address of the first element to alias (``data`` should be ``None``). This may point inside a larger
+                external allocation.
+            capacity: Maximum number of bytes addressable from ``ptr`` (``data`` should be ``None``).
             device: Device the array lives on
             copy: Whether the incoming ``data`` will be copied or aliased. Aliasing requires that
                 the incoming ``data`` already lives on the ``device`` specified and the data types match.
@@ -3296,6 +3491,12 @@ class array(Array[DType, NDim]):
         # reference to other array
         self._ref = None
 
+        self._storage_base_ptr: int | None = None
+        """Start of the complete backing storage; unlike ``ptr``, this may precede the array's first element."""
+
+        self._storage_nbytes: int | None = None
+        """Total backing-storage size; unlike ``capacity``, this includes bytes preceding ``ptr``."""
+
         # canonicalize dtype
         if dtype is int:
             dtype = int32
@@ -3303,6 +3504,9 @@ class array(Array[DType, NDim]):
             dtype = float32
         elif dtype is builtins.bool:
             dtype = bool
+
+        if is_native_type(dtype) and (requires_grad or grad is not None or retain_grad):
+            raise ValueError("Native value-type arrays do not support automatic differentiation")
 
         # convert shape to tuple (or leave shape=None if neither shape nor length were specified)
         if shape is not None:
@@ -3523,6 +3727,38 @@ class array(Array[DType, NDim]):
                     arr = arr.view(np.uint16)
                 else:
                     raise RuntimeError(f"Unsupported input data dtype: {arr.dtype}")
+        elif is_native_type(dtype):
+            npdtype = np.dtype(dtype)
+            if isinstance(data, np.ndarray):
+                if dtype._wp_native_type_.fields is None:
+                    valid_source_dtype = (
+                        data.dtype.kind == "V"
+                        and data.dtype.fields is None
+                        and data.dtype.itemsize == ctypes.sizeof(dtype)
+                    )
+                else:
+                    valid_source_dtype = data.dtype == npdtype or data.dtype == np.dtype(npdtype.descr)
+                if not valid_source_dtype:
+                    expected_dtype = (
+                        np.dtype(f"V{ctypes.sizeof(dtype)}") if dtype._wp_native_type_.fields is None else npdtype
+                    )
+                    raise RuntimeError(
+                        f"Invalid source data type for native array, expected {expected_dtype}, got {data.dtype}"
+                    )
+                arr = data
+            elif isinstance(data, (list, tuple)):
+                try:
+                    ctype_arr = (dtype * len(data))(*data)
+                    arr = np.frombuffer(ctype_arr, dtype=npdtype)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Error while trying to construct Warp array from a sequence of {dtype.__name__} values: {e}"
+                    ) from e
+            else:
+                raise RuntimeError(
+                    "Invalid data argument for a native array, expected a sequence of ctypes values "
+                    "or a NumPy structured array"
+                )
         elif isinstance(dtype, warp._src.codegen.Struct):
             if isinstance(data, np.ndarray):
                 # construct from numpy structured array
@@ -3839,6 +4075,22 @@ class array(Array[DType, NDim]):
             pass
 
     @property
+    def __array__(self):
+        # raising an AttributeError here makes hasattr() return False, so CPU arrays keep converting through
+        # __array_interface__
+        if self.device is not None and self.device.is_cpu:
+            raise AttributeError(f"__array__ not supported because device is {self.device}")
+
+        # NumPy calls the value returned by this property, so return a function that raises the error
+        def reject(dtype=None, copy=None):
+            raise TypeError(
+                f"Warp does not support implicit NumPy conversion for arrays on device {self.device}. "
+                "Call array.numpy() explicitly to obtain a NumPy array."
+            )
+
+        return reject
+
+    @property
     def __array_interface__(self):
         # raising an AttributeError here makes hasattr() return False
         if self.device is None or not self.device.is_cpu:
@@ -3851,6 +4103,10 @@ class array(Array[DType, NDim]):
                 arr_shape = self.shape
                 arr_strides = self.strides
                 descr = self.dtype.numpy_dtype()
+            elif is_native_type(self.dtype):
+                arr_shape = self.shape
+                arr_strides = self.strides
+                descr = np.dtype(self.dtype).descr if self.dtype._wp_native_type_.fields is not None else None
             elif issubclass(self.dtype, ctypes.Array):
                 # vector type, flatten the dimensions into one tuple
                 arr_shape = (*self.shape, *self.dtype._shape_)
@@ -3863,8 +4119,15 @@ class array(Array[DType, NDim]):
                 arr_strides = self.strides
                 descr = None
 
+            if self.ptr:
+                data_ptr = self.ptr
+            elif self.size == 0:
+                data_ptr = ctypes.addressof(_ARRAY_INTERFACE_EMPTY_DATA)
+            else:
+                data_ptr = 0
+
             self._array_interface = {
-                "data": (self.ptr if self.ptr is not None else 0, False),
+                "data": (data_ptr, False),
                 "shape": tuple(arr_shape),
                 "strides": tuple(arr_strides),
                 "typestr": type_typestr(self.dtype),
@@ -4118,6 +4381,8 @@ class array(Array[DType, NDim]):
             self._grad = None
             self._requires_grad = False
         else:
+            if is_native_type(self.dtype):
+                raise ValueError("Native value-type arrays do not support automatic differentiation")
             # make sure the given gradient array is compatible
             if grad.dtype != self.dtype:
                 raise ValueError(
@@ -4147,6 +4412,8 @@ class array(Array[DType, NDim]):
 
     @requires_grad.setter
     def requires_grad(self, value: builtins.bool):
+        if value and is_native_type(self.dtype):
+            raise ValueError("Native value-type arrays do not support automatic differentiation")
         if value and self._grad is None:
             self._alloc_grad()
         elif not value:
@@ -4229,6 +4496,13 @@ class array(Array[DType, NDim]):
 
     def zero_(self):
         """Zero out the array entries."""
+        if self.size == 0:
+            # Skip the zero-byte memset, but still record the initialization:
+            # otherwise verify_autograd_array_access keeps a stale "read" mark
+            # on the empty array and a later guarded write reports a false
+            # write-after-read.
+            self.mark_init()
+            return
         self._apic_ensure_tracked()
         if self.is_contiguous:
             # simple memset is usually faster than generic fill
@@ -4280,6 +4554,16 @@ class array(Array[DType, NDim]):
                 else:
                     raise ValueError(
                         f"Invalid initializer value for struct {self.dtype.cls.__name__}, expected struct instance or 0"
+                    )
+            elif is_native_type(self.dtype):
+                if isinstance(value, self.dtype):
+                    cvalue = value
+                elif value == 0:
+                    cvalue = self.dtype()
+                else:
+                    raise ValueError(
+                        f"Invalid initializer value for native type {self.dtype.__name__}, "
+                        f"expected {self.dtype.__name__} instance or 0"
                     )
             elif issubclass(self.dtype, ctypes.Array):
                 # vector/matrix
@@ -4385,6 +4669,12 @@ class array(Array[DType, NDim]):
             if isinstance(self.dtype, warp._src.codegen.Struct):
                 npdtype = self.dtype.numpy_dtype()
                 npshape = self.shape
+            elif is_native_type(self.dtype):
+                if self.dtype._wp_native_type_.fields is None:
+                    npdtype = np.dtype(f"V{ctypes.sizeof(self.dtype)}")
+                else:
+                    npdtype = np.dtype(self.dtype)
+                npshape = self.shape
             elif issubclass(self.dtype, ctypes.Array):
                 npdtype = warp_type_to_np_dtype[self.dtype._wp_scalar_type_]
                 npshape = (*self.shape, *self.dtype._shape_)
@@ -4421,6 +4711,8 @@ class array(Array[DType, NDim]):
 
         if isinstance(self.dtype, warp._src.codegen.Struct):
             p = ctypes.cast(self.ptr, ctypes.POINTER(self.dtype.ctype))
+        elif is_native_type(self.dtype):
+            p = ctypes.cast(self.ptr, ctypes.POINTER(self.dtype))
         else:
             p = ctypes.cast(self.ptr, ctypes.POINTER(self.dtype._type_))
 
@@ -4439,6 +4731,10 @@ class array(Array[DType, NDim]):
             data = a.ctypes.data
             stride = a.strides[0]
             return [self.dtype.from_ptr(data + i * stride) for i in range(self.size)]
+        elif is_native_type(self.dtype):
+            a = a.flatten()
+            stride = a.strides[0]
+            return [self.dtype.from_buffer_copy(a, i * stride) for i in range(self.size)]
         elif issubclass(self.dtype, ctypes.Array):
             # vector/matrix - flatten, but preserve inner vector/matrix dimensions
             a = a.reshape((self.size, *self.dtype._shape_))
@@ -5399,6 +5695,103 @@ _ARRAY_ANNOTATION_MAP = {
     indexedfabricarray: _IndexedFabricArrayAnnotation,
 }
 
+# Registered classes are retained by array_types. Compare identities without invoking
+# application metaclass hashing or equality; this is not a cache of user classes.
+_ARRAY_FAMILY_IDS = frozenset(id(cls) for cls in array_types)
+_ARRAY_CTYPE_MAP = {
+    array: array_t,
+    indexedarray: indexedarray_t,
+    fabricarray: fabricarray_t,
+    indexedfabricarray: indexedfabricarray_t,
+}
+
+
+def _resolve_array_family(value) -> type | None:
+    """Resolve a real array ancestor without consulting a spoofable ``__class__``.
+
+    Unrelated native families cannot share a descriptor layout. Mixins and diamonds
+    within one family are valid; ``fixedarray`` keeps its separate compiler type.
+    Lightweight annotations describe arrays but have no native array ancestor,
+    so they resolve to ``None``.
+    """
+    cls = type(value)
+    if id(cls) in _ARRAY_FAMILY_IDS:
+        return cls
+
+    # Most inputs are regular arrays or unrelated objects, requiring no MRO scan.
+    if not issubclass(cls, (indexedarray, fabricarray, indexedfabricarray, fixedarray, _ArrayAnnotationBase)):
+        return array if issubclass(cls, array) else None
+
+    candidates = [ancestor for ancestor in cls.__mro__ if id(ancestor) in _ARRAY_FAMILY_IDS]
+    if len(candidates) > 1:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if not any(candidate is not other and candidate in other.__mro__ for other in candidates)
+        ]
+        if len(candidates) > 1:
+            names = ", ".join(f"wp.{candidate.__name__}" for candidate in candidates)
+            raise TypeError(
+                f"Array subclass '{cls.__qualname__}' derives from unrelated Warp array families ({names}); "
+                "exactly one native array family is required"
+            )
+    return candidates[0] if candidates else None
+
+
+def _normalize_array_argument_type(value):
+    """Describe host array values with storage-free native annotations."""
+    cls = type(value)
+    if cls is type or cls is int or cls is float or cls is builtins.bool or issubclass(cls, _ArrayAnnotationBase):
+        return value
+    family = _resolve_array_family(value)
+    if family is fixedarray:
+        raise TypeError(
+            "Cannot use wp.fixedarray as a host argument or kernel overload type; it is a compiler-only stack array"
+        )
+    annotation_cls = _ARRAY_ANNOTATION_MAP.get(family)
+    if annotation_cls is None:
+        return value
+    return annotation_cls(value.dtype, value.ndim)
+
+
+def _validate_array_subclass_descriptor(value, descriptor, expected_family, ndim):
+    """Validate a subclass descriptor's layout before passing it to native code.
+
+    This checks representation, not pointer validity or allocation ownership.
+    Exact built-in arrays retain their existing trusted descriptor path.
+    """
+    if type(value) is expected_family:
+        return descriptor
+    descriptor_cls = _ARRAY_CTYPE_MAP[expected_family]
+    if not issubclass(type(descriptor), descriptor_cls):
+        raise TypeError(
+            f"Array subclass '{type(value).__qualname__}' must return {descriptor_cls.__name__} from __ctype__(), "
+            f"got {type(descriptor).__name__}"
+        )
+    if ctypes.sizeof(descriptor) != ctypes.sizeof(descriptor_cls):
+        raise TypeError(
+            f"Array subclass '{type(value).__qualname__}' returned an incompatible {descriptor_cls.__name__} size"
+        )
+    if type(descriptor) is not descriptor_cls:
+        # Use native fields rather than potentially overridden Python properties,
+        # and keep CPU launch cache keys independent of application descriptor classes.
+        original_descriptor = descriptor
+        descriptor = descriptor_cls.from_buffer_copy(descriptor)
+        descriptor._ref = original_descriptor
+    if expected_family is array:
+        descriptor_ndim = descriptor.ndim
+    elif expected_family is indexedarray:
+        descriptor_ndim = descriptor.data.ndim
+    else:
+        return descriptor
+    expected_ndim = value.ndim if ndim is Any else ndim
+    if descriptor_ndim != expected_ndim:
+        raise ValueError(
+            f"Array subclass '{type(value).__qualname__}' returned a descriptor with {descriptor_ndim} dimension(s), "
+            f"expected {expected_ndim}"
+        )
+    return descriptor
+
 
 def _parse_array_subscript(cls, params):
     """Parse subscript parameters for array-like types.
@@ -5427,13 +5820,14 @@ def _parse_array_subscript(cls, params):
 
 
 def array_type_id(a):
-    if matches_array_class(a, array):
+    family = concrete_array_type(a)
+    if family is array or family is fixedarray:
         return ARRAY_TYPE_REGULAR
-    elif matches_array_class(a, indexedarray):
+    elif family is indexedarray:
         return ARRAY_TYPE_INDEXED
-    elif matches_array_class(a, fabricarray):
+    elif family is fabricarray:
         return ARRAY_TYPE_FABRIC
-    elif matches_array_class(a, indexedfabricarray):
+    elif family is indexedfabricarray:
         return ARRAY_TYPE_FABRIC_INDEXED
     else:
         raise ValueError("Invalid array type")
@@ -5729,6 +6123,11 @@ class Bvh:
             The grouped BVH thus allows Warp to perform environment-specific queries—such as collision detection,
             sensor simulation, or rendering—within a unified BVH framework, maintaining compatibility with existing APIs
             and near-identical performance for non-grouped use cases.
+
+        Note:
+            For grouped BVHs built with ``"sah"`` or ``"median"``, the traversal depth limit applies separately
+            to each group subtree. Start queries at the desired group's root to stay within this limit.
+            Traversal from the global root is not guaranteed to fit the query stack for deep grouped trees.
         """
         if len(lowers) != len(uppers):
             raise RuntimeError("The same number of lower and upper bounds must be provided")
@@ -5999,6 +6398,9 @@ class Mesh:
         self._velocities = velocities
         self.indices = indices
         self.groups = groups
+        self.support_winding_number = support_winding_number
+        """Whether the mesh was built with the data structures that
+        :func:`warp.mesh_query_point_sign_winding_number` requires."""
         self.runtime = warp._src.context.runtime
 
         if bvh_constructor is None:
@@ -6152,6 +6554,11 @@ class Mesh:
             self.runtime.verify_cuda_device(self.device)
 
 
+# Must match wp_volume_validation_result in warp/native/warp.h.
+_VOLUME_VALIDATION_SUCCESS = 1
+_VOLUME_VALIDATION_UNSUPPORTED_LAYOUT = 2
+
+
 class Volume:
     """Sparse volumetric data structure based on NanoVDB for efficient 3D sampling."""
 
@@ -6160,6 +6567,7 @@ class Volume:
     LINEAR = constant(1)
     """Enum value to specify trilinear interpolation during sampling"""
     _NANOVDB_LEAF_TABLE_COUNT: ClassVar[int] = 512
+    _NANOVDB_NAME_SIZE: ClassVar[int] = 256
 
     class RebuildInfo(NamedTuple):
         """Capacity metadata for a :class:`Volume` allocated with rebuild support.
@@ -6388,6 +6796,15 @@ class Volume:
         transform_matrix: mat33f
         """Linear part of the index-to-world transform"""
 
+    @staticmethod
+    def _decode_nvdb_name(name_ptr: int) -> str:
+        """Decode a fixed-size NanoVDB name field."""
+        name = ctypes.string_at(name_ptr, Volume._NANOVDB_NAME_SIZE)
+        terminator = name.find(b"\0")
+        if terminator < 0:
+            raise RuntimeError("Invalid NanoVDB name")
+        return name[:terminator].decode("ascii")
+
     def get_grid_info(self) -> Volume.GridInfo:
         """Return the metadata associated with this Volume."""
 
@@ -6412,7 +6829,7 @@ class Volume:
             raise RuntimeError("Invalid volume")
 
         return Volume.GridInfo(
-            name.decode("ascii"),
+            Volume._decode_nvdb_name(name),
             grid_size.value,
             grid_index.value,
             grid_count.value,
@@ -6514,11 +6931,11 @@ class Volume:
             type_str_buffer,
         )
 
-        if buf.value is None:
+        if buf.value is None or name is None:
             raise RuntimeError("Invalid feature array")
 
         return Volume.FeatureArrayInfo(
-            name.decode("ascii"),
+            Volume._decode_nvdb_name(name),
             buf.value,
             value_size.value,
             value_count.value,
@@ -6620,7 +7037,17 @@ class Volume:
         if magic not in (0x304244566F6E614E, 0x314244566F6E614E):  # NanoVDB0 or NanoVDB1 in hex, little-endian
             raise RuntimeError("NanoVDB signature not found on grid!")
 
-        data_array = array(np.frombuffer(grid_data, dtype=np.byte), device=device)
+        grid_array = np.frombuffer(grid_data, dtype=np.byte)
+        warp.init()
+        validation_result = warp._src.context.runtime.core.wp_volume_validate_host(
+            grid_array.ctypes.data, grid_array.size
+        )
+        if validation_result == _VOLUME_VALIDATION_UNSUPPORTED_LAYOUT:
+            raise RuntimeError("Unsupported NanoVDB tree layout")
+        if validation_result != _VOLUME_VALIDATION_SUCCESS:
+            raise RuntimeError("Invalid NanoVDB grid structure")
+
+        data_array = array(grid_array, device=device)
         return cls(data_array)
 
     def save_to_nvdb(self, path, codec: Literal["none", "zip", "blosc"] = "none"):
@@ -6837,15 +7264,15 @@ class Volume:
     ) -> Volume:
         """Create a :class:`Volume` object from a dense 3D NumPy array.
 
-        This function is only supported for CUDA devices.
-
         Args:
             min_world: The 3D coordinate of the lower corner of the volume.
             voxel_size: The size of each voxel in spatial
                 coordinates. Can be a scalar for isotropic voxels or a 3-element
                 sequence ``(sx, sy, sz)`` for anisotropic voxels.
-            bg_value: Background value
-            device: The CUDA device to create the volume on, e.g.: ``"cuda"`` or ``"cuda:0"``.
+            bg_value: Value of unallocated voxels of the volume. A four-dimensional ``ndarray`` with a
+                length-three last axis makes a ``vec3f`` volume. For scalar data, a Python ``int``
+                ``bg_value`` makes an ``int32`` volume; other values make a ``float32`` volume.
+            device: The device to create the volume on.
 
         Returns:
             A ``warp.Volume`` object.
@@ -6932,8 +7359,6 @@ class Volume:
     ) -> Volume:
         """Allocate a new Volume based on the bounding box defined by min and max.
 
-        This function is only supported for CUDA devices.
-
         Allocate a volume that is large enough to contain voxels [min[0], min[1], min[2]] - [max[0], max[1], max[2]], inclusive.
         If points_in_world_space is true, then min and max are first converted to index space using the given voxel size
         (per-axis for anisotropic volumes) and translation, and the volume is allocated with those.
@@ -6946,10 +7371,14 @@ class Volume:
             max: Upper 3D coordinates of the bounding box in index space or world space, inclusive.
             voxel_size: Voxel size(s) of the new volume. Can be a scalar for isotropic
                 voxels or a 3-element sequence ``(sx, sy, sz)`` for anisotropic voxels.
-            bg_value: Value of unallocated voxels of the volume, also defines the volume's type,
-              a :class:`warp.vec3` volume is created if this is `array-like`, otherwise a float volume is created
+            bg_value: Value of unallocated voxels of the volume, also defines the volume's type.
+              An index volume will be created if ``bg_value`` is ``None``.
+              Other supported grid types are ``int32``, ``uint32``, ``int64``, ``float32``, ``float64``,
+              ``vec3f``, ``vec3d``, ``vec4f``, and ``vec4d``. A plain list or NumPy array always makes a
+              single-precision grid: ``vec3f`` for three values, ``vec4f`` for four. To get a
+              double-precision grid, pass a Warp vector such as ``vec3d``.
             translation: Translation between the index and world spaces.
-            device: The CUDA device to create the volume on, e.g.: ``"cuda"`` or ``"cuda:0"``.
+            device: The device to create the volume on.
         """
         voxel_size = cls._normalize_voxel_size(voxel_size)
 
@@ -7031,7 +7460,17 @@ class Volume:
 
     # nanovdb types for which we instantiate the grid builder
     # Should be in sync with WP_VOLUME_BUILDER_INSTANTIATE_TYPES in volume_builder.h
-    _supported_allocation_types = ("int32", "uint32", "int64", "float", "double", "Vec3f", "Vec3d", "Vec4f")
+    _supported_allocation_types = (
+        "int32",
+        "uint32",
+        "int64",
+        "float",
+        "double",
+        "Vec3f",
+        "Vec3d",
+        "Vec4f",
+        "Vec4d",
+    )
 
     REBUILD_SUCCESS: ClassVar[int] = 0
     """Rebuild completed without setting a status flag."""
@@ -7069,8 +7508,6 @@ class Volume:
     ) -> Volume:
         """Allocate a new :class:`Volume` with active tiles for each point ``tile_points``.
 
-        This function is supported on CPU and CUDA devices.
-
         The smallest unit of allocation is a dense tile of 8x8x8 voxels.
         This is the primary method for allocating sparse volumes.
         It uses an array of points indicating the tiles that must be allocated.
@@ -7097,7 +7534,10 @@ class Volume:
             voxel_size: Voxel size(s) of the new volume. Ignored if ``transform`` is given.
             bg_value: Value of unallocated voxels of the volume, also defines the volume's type.
               An index volume will be created if ``bg_value`` is ``None``.
-              Other supported grid types are ``int``, ``float``, ``vec3f``, and ``vec4f``.
+              Other supported grid types are ``int32``, ``uint32``, ``int64``, ``float32``, ``float64``,
+              ``vec3f``, ``vec3d``, ``vec4f``, and ``vec4d``. A plain list or NumPy array always makes a
+              single-precision grid: ``vec3f`` for three values, ``vec4f`` for four. To get a
+              double-precision grid, pass a Warp vector such as ``vec3d``.
             translation: Translation between the index and world spaces.
             transform: Linear transform between the index and world spaces.
               If ``None``, deduced from ``voxel_size``.
@@ -7111,7 +7551,7 @@ class Volume:
             status: Optional one-element ``uint32`` array receiving ``Volume.REBUILD_*`` status flags from the
               initial build. ``Volume.REBUILD_SUCCESS`` means the requested topology fit in the reserved capacity.
             point_mask: Optional ``int32`` array with one entry per point. Points with a zero mask value are ignored.
-            device: The device to create the volume on, e.g. ``"cpu"``, ``"cuda"``, or ``"cuda:0"``.
+            device: The device to create the volume on.
 
         Raises:
             RuntimeError: If ``tile_points``, ``point_mask``, or ``status`` is not a contiguous array of the
@@ -7321,7 +7761,7 @@ class Volume:
             status: Optional one-element ``uint32`` array receiving ``Volume.REBUILD_*`` status flags from the
                 initial build. ``Volume.REBUILD_SUCCESS`` means the requested topology fit in the reserved capacity.
             point_mask: Optional ``int32`` array with one entry per point. Points with a zero mask value are ignored.
-            device: The device to create the volume on, e.g. ``"cpu"``, ``"cuda"``, or ``"cuda:0"``.
+            device: The device to create the volume on.
 
         Raises:
             RuntimeError: If ``voxel_points``, ``point_mask``, or ``status`` is not a contiguous array of the
@@ -8033,24 +8473,44 @@ def infer_argument_types(args: list[Any], template_types, arg_names: list[str] |
         arg = args[i]
         arg_type = type(arg)
         arg_name = arg_names[i] if arg_names else str(i)
-        if arg_type in array_types:
-            arg_types.append(arg_type(dtype=arg.dtype, ndim=arg.ndim))
+        if arg_type is int or arg_type is float or arg_type is builtins.bool:
+            arg_types.append(type_to_warp(arg_type))
+            continue
+        try:
+            family = None if issubclass(arg_type, _ArrayAnnotationBase) else _resolve_array_family(arg)
+        except TypeError as error:
+            raise TypeError(f"Unable to infer the type of argument '{arg_name}': {error}") from error
+        if family is not None:
+            annotation_cls = _ARRAY_ANNOTATION_MAP.get(family)
+            if annotation_cls is not None:
+                arg_types.append(annotation_cls(arg.dtype, arg.ndim))
+            else:
+                # A fixedarray has the type code of a regular array but a different native layout.
+                # Reject host values before they can register a colliding specialization.
+                raise TypeError(
+                    f"Unable to infer the type of argument '{arg_name}', got a wp.fixedarray, "
+                    "a compiler-only type for stack arrays inside kernels"
+                )
         elif arg_type in scalar_and_bool_types:
             arg_types.append(arg_type)
-        elif arg_type in (int, float, builtins.bool):
-            # canonicalize type
-            arg_types.append(type_to_warp(arg_type))
         elif hasattr(arg_type, "_wp_scalar_type_"):
             # vector/matrix type
             arg_types.append(arg_type)
         elif issubclass(arg_type, warp._src.codegen.StructInstance):
             # a struct
             arg_types.append(arg._cls)
+        elif is_native_type(arg_type):
+            arg_types.append(arg_type)
         elif arg is None:
             # allow passing None for arrays
             t = template_types[i]
             if is_array(t):
-                arg_types.append(type(t)(dtype=t.dtype, ndim=t.ndim))
+                family = concrete_array_type(t)
+                annotation_cls = _ARRAY_ANNOTATION_MAP.get(family)
+                if annotation_cls is not None:
+                    arg_types.append(annotation_cls(t.dtype, t.ndim))
+                else:
+                    arg_types.append(family(dtype=t.dtype, shape=t.shape))
             else:
                 raise TypeError(f"Unable to infer the type of argument '{arg_name}', got None")
         else:
@@ -8085,10 +8545,16 @@ simple_type_codes = {
     hash_grid_query_type(float16): "hgqh",
     hash_grid_query_type(float32): "hgq",
     hash_grid_query_type(float64): "hgqd",
-    MeshQueryAABB: "mqa",
+    MeshQuery: "mqa",
+    MeshQueryAABB: "mqab",
+    _MeshQuerySphere: "mqs",
     MeshQueryPoint: "mqp",
     MeshQueryRay: "mqr",
     BvhQuery: "bvhq",
+    _BvhQueryAabb: "bvhqa",
+    _BvhQueryRay: "bvhqr",
+    _BvhQueryCapsule: "bvhqc",
+    _BvhQuerySphere: "bvhqs",
     # Textures are added at the end of the file to avoid circular imports
 }
 
@@ -8114,26 +8580,17 @@ def is_builtin_callable_annotation(annotation) -> bool:
 def get_type_code(arg_type) -> str:
     if arg_type is Any:
         # special case for generics
-        # note: since Python 3.11 Any is a type, so we check for it first
         return "?"
     elif is_warp_function_annotation(arg_type):
         return "c"
-    elif (
-        sys.version_info < (3, 11)
-        and hasattr(types, "GenericAlias")
-        and isinstance(arg_type, types.GenericAlias)
-        and arg_type.__origin__ is tuple
-    ):
-        # Handle tuple[...] on Python <= 3.10 where it creates types.GenericAlias
-        # This must come before isinstance(arg_type, type) check
-        arg_types = arg_type.__args__
-        return f"tpl{len(arg_types)}{''.join(get_type_code(x) for x in arg_types)}"
     elif get_origin(arg_type) is Union or isinstance(arg_type, types.UnionType):
         raise TypeError(
             "Union type annotations are only supported at Python scope and are invalid in Warp kernels/functions"
         )
     elif isinstance(arg_type, type):
-        if hasattr(arg_type, "_wp_scalar_type_"):
+        if is_native_type(arg_type):
+            return f"nt{arg_type._wp_native_type_.type_code}"
+        elif hasattr(arg_type, "_wp_scalar_type_"):
             # vector/matrix type
             dtype_code = get_type_code(arg_type._wp_scalar_type_)
             # check for "special" vector/matrix subtypes

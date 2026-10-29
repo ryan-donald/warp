@@ -33,7 +33,7 @@ from warp.tests.unittest_utils import *
 
 
 def _load_cudart():
-    """Load the CUDA runtime library and bind ``cudaFree``.
+    """Load the CUDA runtime library and bind ``cudaFree`` and ``cudaGetLastError``.
 
     Returns ``None`` if the library cannot be located, in which case the
     tests below will skip (see :func:`unittest.TestCase.skipTest`).
@@ -47,6 +47,8 @@ def _load_cudart():
         return None
     lib.cudaFree.argtypes = [ctypes.c_void_p]
     lib.cudaFree.restype = ctypes.c_int
+    lib.cudaGetLastError.argtypes = []
+    lib.cudaGetLastError.restype = ctypes.c_int
     return lib
 
 
@@ -58,7 +60,7 @@ class TestCaptureMode(unittest.TestCase):
 
 
 def test_relaxed_allows_capture_unsafe_runtime_call(test, device):
-    """``CaptureMode.RELAXED`` tolerates ``cudaFree(0)`` during capture."""
+    """Verify that ``CaptureMode.RELAXED`` tolerates ``cudaFree(0)`` during capture."""
     if CUDART is None:
         test.skipTest("libcudart not available")
 
@@ -76,7 +78,7 @@ def test_relaxed_allows_capture_unsafe_runtime_call(test, device):
 
 
 def test_relaxed_capture_allows_side_stream_fill(test, device):
-    """Built-in kernels on side streams remain valid during relaxed capture."""
+    """Verify that built-in kernels on side streams remain valid during relaxed capture."""
     with wp.ScopedDevice(device):
         capture_stream = wp.Stream(device)
         side_stream = wp.Stream(device)
@@ -117,7 +119,7 @@ def test_relaxed_capture_allows_side_stream_fill(test, device):
 
 
 def test_thread_local_rejects_capture_unsafe_runtime_call(test, device):
-    """``CaptureMode.THREAD_LOCAL`` rejects ``cudaFree(0)`` during capture.
+    """Verify that ``CaptureMode.THREAD_LOCAL`` rejects ``cudaFree(0)`` during capture.
 
     The rejection invalidates the capture, so ``wp.capture_end`` (called
     from ``ScopedCapture.__exit__``) raises a ``RuntimeError``. We catch it
@@ -125,6 +127,11 @@ def test_thread_local_rejects_capture_unsafe_runtime_call(test, device):
     """
     if CUDART is None:
         test.skipTest("libcudart not available")
+
+    # The rejected cudaFree(0) leaves this thread's last error set in the shared
+    # CUDA runtime. Clear it so later runtime users in this process, such as
+    # PyTorch, do not report the stale error on their next error check.
+    test.addCleanup(CUDART.cudaGetLastError)
 
     with wp.ScopedDevice(device):
         wp.synchronize_device()
